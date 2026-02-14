@@ -1,7 +1,7 @@
 # zotero-write-mcp
 
 [![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![MCP](https://img.shields.io/badge/MCP-FastMCP-green.svg)](https://github.com/jlowin/fastmcp)
 
 **Model Context Protocol (MCP) server for writing, editing, and merging Zotero library entries.** Designed as the **write complement** to the read-only [`zotero-mcp`](https://github.com/54yyyu/zotero-mcp) server — together they give AI agents (Claude, Windsurf, Cline, etc.) full CRUD access to your Zotero library.
