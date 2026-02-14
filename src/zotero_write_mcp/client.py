@@ -1,0 +1,366 @@
+"""Zotero hybrid API client: local reads, web API writes."""
+import hashlib
+import json
+import os
+from typing import Any, Optional
+
+import httpx
+
+
+class ZoteroClient:
+    """Hybrid client: local API for reads, web API (api.zotero.org) for writes.
+
+    The Zotero local API (port 23119) is read-only. All write operations
+    (POST/PUT/PATCH/DELETE) are routed through the Zotero Web API v3, which
+    requires an API key with write permissions.
+    """
+
+    def __init__(self):
+        # ── Local API (reads) ──────────────────────────────────────
+        self.local_url = os.environ.get(
+            "ZOTERO_LOCAL_URL", "http://127.0.0.1:23119/api"
+        ).rstrip("/")
+        self._local_headers = {"Zotero-Allowed-Request": "true"}
+
+        # ── Web API (writes) ──────────────────────────────────────
+        self.web_url = "https://api.zotero.org"
+        self._api_key = os.environ.get("ZOTERO_API_KEY", "")
+        if not self._api_key:
+            raise RuntimeError(
+                "ZOTERO_API_KEY environment variable is required for write operations. "
+                "Generate one at https://www.zotero.org/settings/keys"
+            )
+        self._web_headers = {
+            "Zotero-API-Key": self._api_key,
+            "Zotero-API-Version": "3",
+        }
+
+        self._library_id: Optional[int] = None
+        self._client = httpx.Client(timeout=30.0)
+
+    # ── Backward compat ───────────────────────────────────────────
+    @property
+    def base_url(self) -> str:
+        """Alias for local_url (backward compat)."""
+        return self.local_url
+
+    @property
+    def headers(self) -> dict:
+        """Alias for local headers (backward compat)."""
+        return self._local_headers
+
+    # ── Library detection ─────────────────────────────────────────
+
+    @property
+    def library_id(self) -> int:
+        if self._library_id is None:
+            self._library_id = self._detect_library_id()
+        return self._library_id
+
+    @property
+    def lib_prefix(self) -> str:
+        return f"{self.local_url}/users/{self.library_id}"
+
+    def _detect_library_id(self) -> int:
+        """Auto-detect library ID from local Zotero instance."""
+        r = self._get("/users/0/items", params={"limit": 1, "format": "json"})
+        if r and len(r) > 0 and "library" in r[0]:
+            return r[0]["library"]["id"]
+        r = self._get("/users/0/collections", params={"limit": 1, "format": "json"})
+        if r and len(r) > 0 and "library" in r[0]:
+            return r[0]["library"]["id"]
+        raise RuntimeError("Could not detect Zotero library ID from local API.")
+
+    # ── Local API (reads) ─────────────────────────────────────────
+
+    def _get(self, path: str, params: Optional[dict] = None) -> Any:
+        """GET via local API for fast reads."""
+        url = f"{self.local_url}{path}"
+        resp = self._client.get(url, headers=self._local_headers, params=params or {})
+        resp.raise_for_status()
+        return resp.json()
+
+    # ── Web API (writes) ──────────────────────────────────────────
+
+    def _web_post(self, path: str, data: Any, extra_headers: Optional[dict] = None) -> Any:
+        """POST via Zotero Web API."""
+        url = f"{self.web_url}{path}"
+        hdrs = {**self._web_headers, "Content-Type": "application/json"}
+        if extra_headers:
+            hdrs.update(extra_headers)
+        resp = self._client.post(url, headers=hdrs, content=json.dumps(data))
+        resp.raise_for_status()
+        return resp.json() if resp.content else {"status": "ok"}
+
+    def _web_put(self, path: str, data: Any, version: int) -> Any:
+        """PUT via Zotero Web API."""
+        url = f"{self.web_url}{path}"
+        hdrs = {
+            **self._web_headers,
+            "Content-Type": "application/json",
+            "If-Unmodified-Since-Version": str(version),
+        }
+        resp = self._client.put(url, headers=hdrs, content=json.dumps(data))
+        resp.raise_for_status()
+        return resp.json() if resp.content else {"status": "ok"}
+
+    def _web_patch(self, path: str, data: Any, version: int) -> Any:
+        """PATCH via Zotero Web API."""
+        url = f"{self.web_url}{path}"
+        hdrs = {
+            **self._web_headers,
+            "Content-Type": "application/json",
+            "If-Unmodified-Since-Version": str(version),
+        }
+        resp = self._client.patch(url, headers=hdrs, content=json.dumps(data))
+        resp.raise_for_status()
+        return resp.json() if resp.content else {"status": "ok"}
+
+    def _web_delete(self, path: str, version: int) -> bool:
+        """DELETE via Zotero Web API."""
+        url = f"{self.web_url}{path}"
+        hdrs = {
+            **self._web_headers,
+            "If-Unmodified-Since-Version": str(version),
+        }
+        resp = self._client.delete(url, headers=hdrs)
+        resp.raise_for_status()
+        return True
+
+    # ── Backward-compat aliases (server.py calls these) ───────────
+
+    def _post(self, path: str, data: Any, extra_headers: Optional[dict] = None) -> Any:
+        """Route POST to web API."""
+        return self._web_post(path, data, extra_headers)
+
+    def _put(self, path: str, data: Any, version: int) -> Any:
+        """Route PUT to web API."""
+        return self._web_put(path, data, version)
+
+    def _delete(self, path: str, version: int) -> bool:
+        """Route DELETE to web API."""
+        return self._web_delete(path, version)
+
+    # ── Web API (reads for version-sensitive ops) ─────────────────
+
+    def _web_get(self, path: str, params: Optional[dict] = None) -> Any:
+        """GET via Zotero Web API (for version-accurate reads before writes)."""
+        url = f"{self.web_url}{path}"
+        resp = self._client.get(url, headers=self._web_headers, params=params or {})
+        resp.raise_for_status()
+        return resp.json()
+
+    # ── Item CRUD ─────────────────────────────────────────────────
+
+    def get_item(self, item_key: str) -> dict:
+        """Read item via local API."""
+        return self._get(f"/users/{self.library_id}/items/{item_key}")
+
+    def get_item_web(self, item_key: str) -> dict:
+        """Read item via web API (guaranteed current version)."""
+        return self._web_get(f"/users/{self.library_id}/items/{item_key}")
+
+    def search_items(self, query: str, limit: int = 20,
+                     qmode: str = "titleCreatorYear") -> list[dict]:
+        return self._get(
+            f"/users/{self.library_id}/items",
+            params={
+                "q": query,
+                "qmode": qmode,
+                "limit": limit,
+                "format": "json",
+                "itemType": "-attachment",
+            },
+        )
+
+    def get_item_template(self, item_type: str) -> dict:
+        """Get item template. Try local API first, fall back to web API."""
+        try:
+            return self._get("/items/new", params={"itemType": item_type})
+        except httpx.HTTPStatusError:
+            return self._web_get("/items/new", params={"itemType": item_type})
+
+    def create_items(self, items: list[dict]) -> dict:
+        """Create items via web API."""
+        return self._web_post(f"/users/{self.library_id}/items", items)
+
+    def update_item(self, item_key: str, data: dict, version: int) -> Any:
+        """Update item via web API (PATCH for partial updates).
+        
+        Retries once on 412 Precondition Failed by re-reading current version.
+        """
+        try:
+            return self._web_patch(
+                f"/users/{self.library_id}/items/{item_key}", data, version
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 412:
+                # Version mismatch — re-read and retry
+                fresh = self.get_item_web(item_key)
+                fresh_version = fresh.get("version", fresh.get("data", {}).get("version"))
+                return self._web_patch(
+                    f"/users/{self.library_id}/items/{item_key}", data, fresh_version
+                )
+            raise
+
+    def delete_item(self, item_key: str, version: int) -> bool:
+        return self._web_delete(
+            f"/users/{self.library_id}/items/{item_key}", version
+        )
+
+    def get_all_items(self, limit: int = 100, start: int = 0,
+                      item_type: str = "-attachment") -> list[dict]:
+        return self._get(
+            f"/users/{self.library_id}/items",
+            params={
+                "limit": limit,
+                "start": start,
+                "format": "json",
+                "itemType": item_type,
+            },
+        )
+
+    # ── Attachment Operations ─────────────────────────────────────
+
+    def get_item_children(self, item_key: str) -> list[dict]:
+        """Get child items (attachments, notes) via local API."""
+        return self._get(
+            f"/users/{self.library_id}/items/{item_key}/children",
+            params={"format": "json"},
+        )
+
+    def get_item_children_web(self, item_key: str) -> list[dict]:
+        """Get child items via web API (current state after recent writes)."""
+        return self._web_get(
+            f"/users/{self.library_id}/items/{item_key}/children",
+            params={"format": "json"},
+        )
+
+    def create_linked_file_attachment(
+        self, parent_key: str, file_path: str, title: str, content_type: str
+    ) -> dict:
+        """Create a linked-file attachment pointing to a file on disk.
+
+        Note: linked_file attachments reference local paths. The web API
+        creates the metadata record; the local Zotero client resolves the path.
+        """
+        attachment_data = {
+            "itemType": "attachment",
+            "parentItem": parent_key,
+            "linkMode": "linked_file",
+            "title": title,
+            "path": file_path,
+            "contentType": content_type,
+            "charset": "",
+            "tags": [],
+            "relations": {},
+        }
+        return self._web_post(f"/users/{self.library_id}/items", [attachment_data])
+
+    def create_imported_file_attachment(
+        self, parent_key: str, file_path: str, title: str, content_type: str
+    ) -> dict:
+        """Create an imported-file attachment via web API file upload protocol.
+
+        Web API file upload:
+        1. Create attachment item metadata
+        2. Request upload authorization from /items/{key}/file
+        3. Upload file bytes to the authorized URL
+        """
+        # Read file
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+        file_size = len(file_bytes)
+        file_md5 = hashlib.md5(file_bytes).hexdigest()
+        filename = os.path.basename(file_path)
+
+        # Step 1: Create attachment item
+        attachment_data = {
+            "itemType": "attachment",
+            "parentItem": parent_key,
+            "linkMode": "imported_file",
+            "title": title,
+            "contentType": content_type,
+            "charset": "",
+            "filename": filename,
+            "tags": [],
+            "relations": {},
+        }
+        result = self._web_post(f"/users/{self.library_id}/items", [attachment_data])
+        success = result.get("success", {})
+        if not success:
+            return result
+
+        att_key = list(success.values())[0]
+
+        # Step 2: Request upload authorization
+        auth_url = f"{self.web_url}/users/{self.library_id}/items/{att_key}/file"
+        auth_hdrs = {
+            **self._web_headers,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "If-None-Match": "*",
+        }
+        auth_body = f"md5={file_md5}&filename={filename}&filesize={file_size}"
+        auth_resp = self._client.post(
+            auth_url, headers=auth_hdrs, content=auth_body
+        )
+
+        if auth_resp.status_code == 200:
+            auth_data = auth_resp.json()
+
+            if auth_data.get("exists"):
+                # File already on server
+                return {"success": success, "uploaded": True, "note": "file already existed"}
+
+            # Step 3: Upload file to the provided URL
+            upload_url = auth_data["url"]
+            upload_hdrs = {
+                "Content-Type": auth_data.get("contentType", content_type),
+            }
+            # Include any prefix/suffix from the authorization
+            upload_body = b""
+            if auth_data.get("prefix"):
+                upload_body += auth_data["prefix"].encode("latin-1")
+            upload_body += file_bytes
+            if auth_data.get("suffix"):
+                upload_body += auth_data["suffix"].encode("latin-1")
+
+            upload_resp = self._client.post(
+                upload_url, headers=upload_hdrs, content=upload_body
+            )
+
+            if upload_resp.status_code in (200, 201, 204):
+                # Step 4: Register upload with Zotero
+                reg_hdrs = {
+                    **self._web_headers,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "If-None-Match": "*",
+                }
+                reg_body = f"upload={auth_data['uploadKey']}"
+                reg_resp = self._client.post(
+                    auth_url, headers=reg_hdrs, content=reg_body
+                )
+                if reg_resp.status_code in (200, 201, 204):
+                    return {"success": success, "uploaded": True}
+                else:
+                    return {
+                        "success": success,
+                        "uploaded": False,
+                        "register_status": reg_resp.status_code,
+                        "register_body": reg_resp.text,
+                    }
+            else:
+                return {
+                    "success": success,
+                    "uploaded": False,
+                    "upload_status": upload_resp.status_code,
+                }
+        elif auth_resp.status_code == 412:
+            return {"success": success, "uploaded": True, "note": "file already existed (412)"}
+        else:
+            return {
+                "success": success,
+                "uploaded": False,
+                "auth_status": auth_resp.status_code,
+                "auth_body": auth_resp.text,
+            }

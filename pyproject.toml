@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zotero-write-mcp"
+version = "0.1.1"
+description = "MCP server for writing, editing, and merging Zotero library entries"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.0",
+    "httpx>=0.27",
+    "bibtexparser>=1.4,<2.0",
+]
+
+[project.scripts]
+zotero-write-mcp = "zotero_write_mcp.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
