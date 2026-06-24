@@ -199,3 +199,221 @@ def snapshot_cluster(
                 "n_notes": len(notes), "n_attachments": len(attachments)},
     )
     return snap
+
+
+# ── verify_merge — the 11-check fail-closed gate (TC-3, §7, INV-COMP) ───────────
+
+@dataclass
+class CheckResult:
+    number: int
+    name: str
+    passed: bool
+    detail: str = ""
+
+
+@dataclass
+class IntegrityReport:
+    """Result of the 11-check gate. ``passed`` is the AND of every check (fail-closed)."""
+    passed: bool
+    checks: list                      # CheckResult[]
+
+    @property
+    def failed(self) -> list:
+        return [c for c in self.checks if not c.passed]
+
+    def to_dict(self) -> dict:
+        return {"pass": self.passed,
+                "checks": [{"number": c.number, "name": c.name, "pass": c.passed, "detail": c.detail}
+                           for c in self.checks]}
+
+
+def _as_list(v: Any) -> list:
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, (list, tuple, set)):
+        return list(v)
+    return [v]
+
+
+def _is_empty(v: Any) -> bool:
+    return v is None or v == "" or v == [] or v == {}
+
+
+def verify_merge(
+    snapshot: ClusterSnapshot,
+    observed: ClusterSnapshot,
+    *,
+    smart_fill: bool = False,
+) -> IntegrityReport:
+    """The 11-check fail-closed gate. Compares the before-image ``snapshot`` to the post-merge
+    (live or projected) ``observed`` cluster state; passes only if EVERY check passes (§7).
+
+    All expectations are recomputed **independently from the snapshot** (never trusting the observed
+    union); each check maps to a Stage-E C-1.x corruption. Pure function — no I/O.
+    """
+    checks: list = []
+    m = snapshot.master_key
+    sm = snapshot.items[m]
+    obs_m = observed.items.get(m)
+    sec_keys = list(snapshot.secondary_keys)
+    cluster_items = [sm] + [snapshot.items[k] for k in sec_keys]
+
+    def add(number, name, passed, detail=""):
+        checks.append(CheckResult(number, name, bool(passed), detail))
+
+    if obs_m is None:
+        add(0, "master-present", False, f"master {m} absent from observed state")
+        return IntegrityReport(False, checks)
+
+    # 1 — item-type equality (master unchanged; every secondary == master type)
+    bad_types = [k for k in sec_keys
+                 if observed.items.get(k) is None or observed.items[k].item_type != obs_m.item_type]
+    add(1, "item-type-equality",
+        obs_m.item_type == sm.item_type and not bad_types,
+        f"master {obs_m.item_type} vs snapshot {sm.item_type}; mismatched secondaries={bad_types}")
+
+    # 2 — version-drift: secondaries UNTOUCHED between snapshot and pre-DELETE verify. The master
+    #     legitimately advances (it was PATCHed); its concurrency is enforced at PATCH-time via
+    #     If-Unmodified-Since-Version, so it is excluded here.
+    drift = [k for k in sec_keys
+             if observed.items.get(k) is None or observed.items[k].version != snapshot.items[k].version]
+    add(2, "version-drift", not drift, f"secondaries with version drift={drift}")
+
+    # 3 — master scalar-field preservation: every non-empty snapshot scalar byte-identical;
+    #     smart_fill may only fill snapshot-EMPTY fields (those are not iterated here).
+    changed = []
+    for k, v in sm.fields.items():
+        if _is_empty(v):
+            continue
+        if obs_m.fields.get(k) != v:
+            changed.append(k)
+    add(3, "master-scalar-preservation", not changed, f"overwritten master fields={changed}")
+
+    # 4 — collections EQUALITY vs independently-recomputed union (==, not superset)
+    expected_cols = set()
+    for it in cluster_items:
+        expected_cols |= set(it.collections)
+    obs_cols = set(obs_m.collections)
+    add(4, "collections-equality", obs_cols == expected_cols,
+        f"observed={sorted(obs_cols)} expected={sorted(expected_cols)}")
+
+    # 5 — tags tuple-superset on (tag, type); no type flips (a flip drops the original tuple → caught)
+    expected_tags = set()
+    for it in cluster_items:
+        expected_tags |= {tuple(t) for t in it.tags}
+    obs_tags = {tuple(t) for t in obs_m.tags}
+    add(5, "tags-tuple-superset", expected_tags <= obs_tags,
+        f"missing tag tuples={sorted(expected_tags - obs_tags)}")
+
+    # 6 — relations superset (full dict) incl. dc:replaces → each secondary
+    expected_rel: dict = {}
+    for it in cluster_items:
+        for pred, vals in it.relations.items():
+            expected_rel.setdefault(pred, set()).update(_as_list(vals))
+    rel_missing = []
+    for pred, vals in expected_rel.items():
+        if not vals <= set(_as_list(obs_m.relations.get(pred))):
+            rel_missing.append(pred)
+    dc_vals = [str(x) for x in _as_list(obs_m.relations.get("dc:replaces"))]
+    dc_missing = [k for k in sec_keys if not any(k in v for v in dc_vals)]
+    add(6, "relations-superset", not rel_missing and not dc_missing,
+        f"missing predicates={rel_missing}; dc:replaces missing secondaries={dc_missing}")
+
+    # 7 — child completeness by presence: every snapshot child live & parented to master
+    obs_parent = {n.key: n.parent_key for n in observed.notes}
+    obs_parent.update({a.key: a.parent_key for a in observed.attachments})
+    orphaned = [c.key for c in (snapshot.notes + snapshot.attachments) if obs_parent.get(c.key) != m]
+    add(7, "child-completeness", not orphaned, f"missing/misparented children={orphaned}")
+
+    # 8 — count parity: notes AND attachments, as SEPARATE invariants
+    add(8, "note-count-parity", len(observed.notes) == len(snapshot.notes),
+        f"observed={len(observed.notes)} snapshot={len(snapshot.notes)}")
+    add(8, "attachment-count-parity", len(observed.attachments) == len(snapshot.attachments),
+        f"observed={len(observed.attachments)} snapshot={len(snapshot.attachments)}")
+
+    # 9 — annotation parity per attachment
+    snap_ann = {a.key: len(a.annotations) for a in snapshot.attachments}
+    obs_ann = {a.key: len(a.annotations) for a in observed.attachments}
+    ann_bad = [k for k, n in snap_ann.items() if obs_ann.get(k) != n]
+    add(9, "annotation-parity", not ann_bad, f"attachments with annotation drift={ann_bad}")
+
+    # 10 — attachment storage integrity: md5 AND filename == snapshot, per attachment
+    snap_st = {a.key: (a.md5, a.filename) for a in snapshot.attachments}
+    obs_st = {a.key: (a.md5, a.filename) for a in observed.attachments}
+    st_bad = [k for k, v in snap_st.items() if obs_st.get(k) != v]
+    add(10, "attachment-storage-integrity", not st_bad, f"md5/filename drift={st_bad}")
+
+    # 11 — citekey preservation: master keeps its pinned BBT citekey (no merge-introduced change).
+    #      ("No new collision" beyond the master's own key needs a library-wide BBT scan — Phase 2.)
+    add(11, "citekey-preservation", obs_m.citekey == sm.citekey,
+        f"observed={obs_m.citekey!r} snapshot={sm.citekey!r}")
+
+    passed = all(c.passed for c in checks)
+    return IntegrityReport(passed, checks)
+
+
+# ── compute_merge_projection — the shadow "golden" post-merge state (no writes) ─
+
+def compute_merge_projection(
+    snapshot: ClusterSnapshot,
+    *,
+    smart_fill: bool = False,
+    library_base: str = "http://zotero.org/users/0/items",
+) -> ClusterSnapshot:
+    """Compute what a merge WOULD produce, purely from the snapshot — NO writes (this is the heart
+    of shadow mode). The master gets the unioned collections/tags/relations + ``dc:replaces``→each
+    secondary; all children reparent to the master; secondaries stay (pre-DELETE). ``verify_merge``
+    against this projection should pass on every check; the injection suite corrupts it one way at a
+    time and asserts the matching check fails.
+    """
+    m = snapshot.master_key
+    sm = snapshot.items[m]
+    sec = [snapshot.items[k] for k in snapshot.secondary_keys]
+    members = [sm] + sec
+
+    cols = list(dict.fromkeys(c for it in members for c in it.collections))
+    tags = list(dict.fromkeys(tuple(t) for it in members for t in it.tags))
+
+    rel: dict = {}
+    for it in members:
+        for pred, vals in it.relations.items():
+            bucket = rel.setdefault(pred, [])
+            for x in _as_list(vals):
+                if x not in bucket:
+                    bucket.append(x)
+    dc = rel.setdefault("dc:replaces", [])
+    for k in snapshot.secondary_keys:
+        uri = f"{library_base}/{k}"
+        if uri not in dc:
+            dc.append(uri)
+
+    fields = dict(sm.fields)
+    if smart_fill:
+        for it in sec:
+            for k, v in it.fields.items():
+                if _is_empty(fields.get(k)) and not _is_empty(v):
+                    fields[k] = v
+
+    proj_master = ItemSnap(
+        key=m, version=sm.version + 1, item_type=sm.item_type,
+        collections=cols, tags=tags, relations=rel, citekey=sm.citekey,
+        fields=fields, json={**sm.json, "collections": cols, "relations": rel, **fields},
+        sha256="",
+    )
+    items = {m: proj_master}
+    for k in snapshot.secondary_keys:
+        items[k] = snapshot.items[k]   # secondaries unchanged (deleted only at Phase-2 commit)
+
+    notes = [NoteSnap(key=n.key, version=n.version + (0 if n.parent_key == m else 1),
+                      parent_key=m, json=n.json) for n in snapshot.notes]
+    atts = [AttachmentSnap(key=a.key, version=a.version + (0 if a.parent_key == m else 1),
+                           parent_key=m, md5=a.md5, filename=a.filename,
+                           content_type=a.content_type, json=a.json, annotations=list(a.annotations))
+            for a in snapshot.attachments]
+
+    return ClusterSnapshot(
+        snapshot_id=f"{snapshot.snapshot_id}-proj", master_key=m,
+        secondary_keys=list(snapshot.secondary_keys), items=items, notes=notes, attachments=atts,
+    )
