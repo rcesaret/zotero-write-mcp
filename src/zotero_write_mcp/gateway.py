@@ -59,6 +59,17 @@ class ConcurrencyConflictError(GatewayError):
     """
 
 
+def library_prefix(library_type: str, library_id: int) -> str:
+    """Build the Web API library path prefix. Parameterized for G6 (group libraries), which are
+    DEFERRED — the harness always passes ``library_type='user'``; the ``/groups`` branch exists so
+    enabling groups later is refactor-free (see :meth:`WriteGateway.preflight_key`)."""
+    if library_type == "user":
+        return f"/users/{library_id}"
+    if library_type == "group":
+        return f"/groups/{library_id}"
+    raise GatewayError(f"unknown library_type {library_type!r} (expected 'user' or 'group')")
+
+
 def _header_int(headers: Any, name: str) -> Optional[int]:
     """Read an integer-valued response header (case-insensitive)."""
     if headers is None:
@@ -184,8 +195,20 @@ class WriteGateway:
                 continue
             return resp
 
+    # ── library prefix / group preflight (G6 deferred, stubbed-inert) ───────────
+    def preflight_key(self, library_type: str, library_id: int) -> None:
+        """For group libraries, assert the API key has write (+ file) permission via GET /keys/<key>
+        before issuing batch writes (DR4). **Stubbed-inert** for personal scope: ``'user'`` is a no-op
+        (G6 deferred). The ``/groups`` branch is wired here later without touching the call sites."""
+        if library_type == "user":
+            return
+        raise GatewayError(
+            "group-library writes are not enabled (G6 deferred). preflight_key + the /groups branch "
+            "are stubbed-inert; wire the GET /keys/<key> permission assertion here to enable.")
+
     # ── create (POST array) ─────────────────────────────────────────────────────
-    def create_items(self, library_id: int, objects: list[dict]) -> WriteResult:
+    def create_items(self, library_id: int, objects: list[dict],
+                     *, library_type: str = "user") -> WriteResult:
         """POST a single batch (≤ ``batch_limit``) of new items; return the structured envelope.
 
         Use :meth:`create_items_chunked` for arbitrary sizes."""
@@ -194,19 +217,21 @@ class WriteGateway:
                 f"create batch of {len(objects)} exceeds the {self.batch_limit}-object limit; "
                 "use create_items_chunked()")
         resp = self._request(
-            "POST", f"/users/{library_id}/items",
+            "POST", f"{library_prefix(library_type, library_id)}/items",
             json=objects, headers={"Content-Type": "application/json"})
         if resp.status_code != 200:
             raise GatewayError(f"create_items: unexpected HTTP {resp.status_code}")
         return parse_write_envelope(resp.json(), resp.headers)
 
-    def create_items_chunked(self, library_id: int, objects: list[dict]) -> WriteResult:
+    def create_items_chunked(self, library_id: int, objects: list[dict],
+                             *, library_type: str = "user") -> WriteResult:
         """Split >50 objects into ≤50-object POSTs and merge, re-indexing the per-index maps to the
         global object positions so ``failed_objects(objects)`` works against the full input list."""
         merged = WriteResult(status_code=200)
         for start in range(0, len(objects), self.batch_limit):
             chunk = objects[start:start + self.batch_limit]
-            self._merge_into(merged, self.create_items(library_id, chunk), start)
+            self._merge_into(
+                merged, self.create_items(library_id, chunk, library_type=library_type), start)
         return merged
 
     @staticmethod
@@ -221,17 +246,18 @@ class WriteGateway:
         if res.last_modified_version is not None:
             merged.last_modified_version = res.last_modified_version
 
-    def resubmit_failed(self, library_id: int, objects: list[dict], result: WriteResult) -> WriteResult:
+    def resubmit_failed(self, library_id: int, objects: list[dict], result: WriteResult,
+                        *, library_type: str = "user") -> WriteResult:
         """Resubmit ONLY the objects that failed in ``result`` (the ``failed[i]`` subset), never the
         whole batch. Returns the result of the resubmission (the caller merges/decides)."""
         failed = result.failed_objects(objects)
         if not failed:
             return WriteResult(status_code=200)
-        return self.create_items_chunked(library_id, failed)
+        return self.create_items_chunked(library_id, failed, library_type=library_type)
 
     # ── update (single PATCH, versioned, 412 re-GET + retry once) ───────────────
     def update_item(self, library_id: int, item_key: str, data: dict,
-                    version: Optional[int]) -> WriteResult:
+                    version: Optional[int], *, library_type: str = "user") -> WriteResult:
         """PATCH a single item. Requires ``version``; retries once on 412 with the fresh version.
 
         Default to PATCH (omitted scalars untouched). Array properties (collections/tags/creators/
@@ -241,10 +267,11 @@ class WriteGateway:
             raise VersionMissingError(
                 f"update_item({item_key}) requires a version (If-Unmodified-Since-Version); "
                 "version-less writes are rejected to prevent a 428.")
-        resp = self._patch_once(library_id, item_key, data, version)
+        prefix = library_prefix(library_type, library_id)
+        resp = self._patch_once(prefix, item_key, data, version)
         if resp.status_code == 412:
-            fresh = self._current_item_version(library_id, item_key)
-            resp = self._patch_once(library_id, item_key, data, fresh)
+            fresh = self._current_item_version(prefix, item_key)
+            resp = self._patch_once(prefix, item_key, data, fresh)
             if resp.status_code == 412:
                 raise ConcurrencyConflictError(
                     f"update_item({item_key}) still 412 after re-GET; re-resolve / re-snapshot required.")
@@ -253,14 +280,14 @@ class WriteGateway:
         return WriteResult(status_code=resp.status_code, item_keys=[item_key],
                            last_modified_version=_to_int_version(resp.headers))
 
-    def _patch_once(self, library_id: int, item_key: str, data: dict, version: int):
+    def _patch_once(self, prefix: str, item_key: str, data: dict, version: int):
         return self._request(
-            "PATCH", f"/users/{library_id}/items/{item_key}", json=data,
+            "PATCH", f"{prefix}/items/{item_key}", json=data,
             headers={"Content-Type": "application/json",
                      "If-Unmodified-Since-Version": str(version)})
 
-    def _current_item_version(self, library_id: int, item_key: str) -> int:
-        resp = self._request("GET", f"/users/{library_id}/items/{item_key}")
+    def _current_item_version(self, prefix: str, item_key: str) -> int:
+        resp = self._request("GET", f"{prefix}/items/{item_key}")
         body = resp.json() or {}
         v = body.get("version")
         if v is None:
@@ -271,7 +298,7 @@ class WriteGateway:
 
     # ── replace (PUT) — forbidden except behind an explicit complete-object flag ─
     def replace_item(self, library_id: int, item_key: str, full_data: dict,
-                     *, complete_object: bool = False) -> WriteResult:
+                     *, complete_object: bool = False, library_type: str = "user") -> WriteResult:
         """Full-replace an item via PUT — guarded. PUT silently drops omitted fields, so this refuses
         unless ``complete_object=True`` and re-GETs the fresh version immediately before writing. Prefer
         :meth:`update_item` (PATCH) for everything else."""
@@ -279,9 +306,10 @@ class WriteGateway:
             raise GatewayError(
                 "PUT (full replace) is forbidden unless complete_object=True — PUT silently drops "
                 "omitted fields. Default to PATCH via update_item().")
-        fresh = self._current_item_version(library_id, item_key)  # immediate re-GET (DR4 guard)
+        prefix = library_prefix(library_type, library_id)
+        fresh = self._current_item_version(prefix, item_key)  # immediate re-GET (DR4 guard)
         resp = self._request(
-            "PUT", f"/users/{library_id}/items/{item_key}", json=full_data,
+            "PUT", f"{prefix}/items/{item_key}", json=full_data,
             headers={"Content-Type": "application/json", "If-Unmodified-Since-Version": str(fresh)})
         if resp.status_code == 412:
             raise ConcurrencyConflictError(f"replace_item({item_key}): 412 on PUT after re-GET.")
@@ -292,7 +320,7 @@ class WriteGateway:
 
     # ── delete (versioned; 412 → caller re-resolves) ────────────────────────────
     def delete_items(self, library_id: int, item_keys: list[str],
-                     version: Optional[int]) -> WriteResult:
+                     version: Optional[int], *, library_type: str = "user") -> WriteResult:
         """DELETE (trash) up to 50 items, gated by the library version. 412 → ConcurrencyConflictError
         (no blind re-delete). Trashes, never purges. Use :meth:`delete_items_chunked` for >50."""
         if version is None:
@@ -303,7 +331,7 @@ class WriteGateway:
                 f"delete batch of {len(item_keys)} exceeds the {self.batch_limit}-object limit; "
                 "use delete_items_chunked()")
         resp = self._request(
-            "DELETE", f"/users/{library_id}/items",
+            "DELETE", f"{library_prefix(library_type, library_id)}/items",
             params={"itemKey": ",".join(item_keys)},
             headers={"If-Unmodified-Since-Version": str(version)})
         if resp.status_code == 412:
@@ -315,14 +343,14 @@ class WriteGateway:
                            last_modified_version=_to_int_version(resp.headers))
 
     def delete_items_chunked(self, library_id: int, item_keys: list[str],
-                             version: int) -> WriteResult:
+                             version: int, *, library_type: str = "user") -> WriteResult:
         """Split >50 deletes into ≤50-key requests, threading the library version forward (each
         successful delete advances ``Last-Modified-Version``)."""
         merged = WriteResult(status_code=204, last_modified_version=version)
         cur = version
         for start in range(0, len(item_keys), self.batch_limit):
             chunk = item_keys[start:start + self.batch_limit]
-            res = self.delete_items(library_id, chunk, cur)
+            res = self.delete_items(library_id, chunk, cur, library_type=library_type)
             merged.item_keys.extend(res.item_keys)
             if res.last_modified_version is not None:
                 merged.last_modified_version = res.last_modified_version

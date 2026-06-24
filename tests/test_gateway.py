@@ -299,3 +299,47 @@ def test_delete_items_chunked_threads_library_version():
     assert t.calls[1]["headers"]["If-Unmodified-Since-Version"] == "101"   # advanced after chunk 1
     assert r.item_keys == ["k0", "k1", "k2"]
     assert r.last_modified_version == 102
+
+
+# ── library prefix / group parameterization (P0-prefix-stub; G6 deferred) ─────
+
+def test_library_prefix_user_and_group():
+    from zotero_write_mcp.gateway import library_prefix
+    assert library_prefix("user", 11056739) == "/users/11056739"
+    assert library_prefix("group", 42) == "/groups/42"
+    with pytest.raises(GatewayError):
+        library_prefix("team", 1)
+
+
+def test_create_items_uses_group_prefix_when_requested():
+    t = FakeTransport([FakeResp(200, body={"success": {"0": "G1"}})])
+    WriteGateway(t).create_items(42, [{"itemType": "book"}], library_type="group")
+    assert t.calls[0]["path"] == "/groups/42/items"
+
+
+def test_default_library_type_is_user():
+    t = FakeTransport([FakeResp(200, body={"success": {"0": "U1"}})])
+    WriteGateway(t).create_items(7, [{"itemType": "book"}])
+    assert t.calls[0]["path"] == "/users/7/items"
+
+
+def test_delete_items_uses_group_prefix_when_requested():
+    t = FakeTransport([FakeResp(204, headers={"Last-Modified-Version": "5"})])
+    WriteGateway(t).delete_items(42, ["K1"], version=4, library_type="group")
+    assert t.calls[0]["path"] == "/groups/42/items"
+
+
+def test_preflight_key_user_noop_group_raises():
+    gw = WriteGateway(FakeTransport([]))
+    assert gw.preflight_key("user", 1) is None          # personal scope: no-op
+    with pytest.raises(GatewayError):
+        gw.preflight_key("group", 1)                     # G6 deferred: stubbed-inert
+
+
+def test_replace_item_reget_and_put_use_user_prefix_path():
+    # guards the prefix wiring: re-GET + PUT must hit /users/.../items/..., not a malformed path
+    t = FakeTransport([FakeResp(200, body={"version": 9}),
+                       FakeResp(204, headers={"Last-Modified-Version": "10"})])
+    WriteGateway(t).replace_item(11056739, "ABCD1234", {"itemType": "book"}, complete_object=True)
+    assert t.calls[0]["path"] == "/users/11056739/items/ABCD1234"   # GET
+    assert t.calls[1]["path"] == "/users/11056739/items/ABCD1234"   # PUT
