@@ -18,12 +18,50 @@ def test_normalize_title_case_punct_diacritics():
 
 
 def test_doi_reuse_across_unrelated_works_demotes():
-    """H-3: same DOI but token-DISJOINT titles (DOI reused across unrelated works) -> demote."""
-    from zotero_write_mcp.dedup import dedup_scan as _scan
+    """DEDUP-3: same DOI but unrelated titles (token Jaccard 0) -> demote."""
     items = [_item("A", DOI="10.1/x", title="Aztec Empire", date="1979"),
              _item("B", DOI="10.1/x", title="Roman History", date="1979")]
-    c = _scan(items)["candidate_clusters"][0]
-    assert not c.auto_accept and "gross title disagreement" in c.conflicts
+    c = dedup_scan(items)["candidate_clusters"][0]
+    assert not c.auto_accept and "title disagreement" in c.conflicts
+
+
+def test_dedup3_shared_stopword_only_demotes():
+    """DEDUP-3: titles sharing only a stopword ('the') under a shared DOI must demote (stopwords stripped)."""
+    items = [_item("A", DOI="10.2/y", title="The Aztec Empire", date="1979"),
+             _item("B", DOI="10.2/y", title="The Roman Conquest", date="1979")]
+    c = dedup_scan(items)["candidate_clusters"][0]
+    assert not c.auto_accept and "title disagreement" in c.conflicts
+
+
+def test_b2_subtitle_collision_demotes():
+    """B2 (DEDUP-1): two distinct same-author/same-year/no-DOI works sharing only the MAIN title (subtitles
+    differ) must NOT auto-accept on the normalized-key path."""
+    items = [_item("A", title="Capitalism: A Treatise on Economics", date="2019",
+                   creators=[{"lastName": "Hoppe"}]),
+             _item("B", title="Capitalism: Competition, Conflict, Crises", date="2019",
+                   creators=[{"lastName": "Hoppe"}])]
+    res = dedup_scan(items)
+    assert res["auto_accept_count"] == 0
+    assert "title disagreement" in res["candidate_clusters"][0].conflicts
+
+
+def test_b2_true_subtitle_duplicate_still_auto_accepts():
+    """The legit case: same main title, one side adds a subtitle, same author/year -> still auto-accept."""
+    items = [_item("A", title="Basin of Mexico", date="1979", creators=[{"lastName": "Sanders"}]),
+             _item("B", title="Basin of Mexico: An Ecological Study", date="1979",
+                   creators=[{"lastName": "Sanders"}])]
+    assert dedup_scan(items)["auto_accept_count"] == 1
+
+
+def test_dedup2_master_ignores_collection_noise():
+    """DEDUP-2: a sparse-bib record drowning in collections/tags/timestamps must NOT outrank a
+    metadata-rich record for master selection (old _completeness would have picked SPARSE)."""
+    by_key = {
+        "SPARSE": _item("SPARSE", title="t", collections=["C1", "C2"], tags=[{"tag": "a"}],
+                        relations={"x": ["y"]}, dateAdded="2020", dateModified="2021"),
+        "RICH": _item("RICH", title="t", date="1979", abstractNote="x", publisher="p", DOI="10/d"),
+    }
+    assert select_master(by_key, ["SPARSE", "RICH"]) == "RICH"
 
 
 def test_normalize_title_drops_subtitle():

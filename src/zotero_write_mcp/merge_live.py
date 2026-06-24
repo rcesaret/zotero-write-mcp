@@ -64,6 +64,17 @@ def merge_cluster(
         fresh_ver[k], fresh_data[k] = ver, data
         if ver != snapshot.items[k].version:
             drift.append(k)
+    # MC-1: children must also be unchanged. A child-only edit bumps the child's version but NOT the
+    # parent's, so the parent-only check above cannot see it — re-read each cluster parent's children.
+    fresh_child_ver: dict = {}
+    for parent in [m, *snapshot.secondary_keys]:
+        for child in reader.get_children(parent):
+            ck, cver, _ = _unwrap(child)
+            fresh_child_ver[ck] = cver
+    for c in (snapshot.notes + snapshot.attachments):
+        cur = fresh_child_ver.get(c.key)
+        if cur is None or cur != c.version:          # edited, re-versioned, or externally re-parented
+            drift.append(c.key)
     if drift:
         return MergePlan(drifted=True, drift_keys=drift)
 
@@ -85,14 +96,22 @@ def merge_cluster(
             if _is_empty(snap_fields.get(k)) and not _is_empty(v) and _is_empty(live.get(k)):
                 master_data[k] = v
 
-    # 3. Execute: PATCH master, then re-parent every child whose original parent is a secondary.
+    # 3. Execute fail-closed (retry_on_412=False): a 412 = a concurrent edit landed AFTER the drift
+    #    check -> abort (report the partial so the caller can rollback + re-snapshot), never blind-re-apply
+    #    a stale body (review M1/F6/MC-2). Re-parent with the FRESH child version (MC-1).
     patches: list = []
-    gateway.update_item(library_id, m, master_data, fresh_ver[m], library_type=library_type)
-    patches.append({"op": "patch-master", "key": m, "version": fresh_ver[m]})
-    for c in (snapshot.notes + snapshot.attachments):
-        if c.parent_key != m:
-            gateway.update_item(library_id, c.key, {"parentItem": m}, c.version, library_type=library_type)
-            patches.append({"op": "reparent", "key": c.key, "version": c.version, "to": m})
+    try:
+        gateway.update_item(library_id, m, master_data, fresh_ver[m],
+                            library_type=library_type, retry_on_412=False)
+        patches.append({"op": "patch-master", "key": m, "version": fresh_ver[m]})
+        for c in (snapshot.notes + snapshot.attachments):
+            if c.parent_key != m:
+                gateway.update_item(library_id, c.key, {"parentItem": m}, fresh_child_ver[c.key],
+                                    library_type=library_type, retry_on_412=False)
+                patches.append({"op": "reparent", "key": c.key, "version": fresh_child_ver[c.key], "to": m})
+    except ConcurrencyConflictError:
+        return MergePlan(drifted=True, drift_keys=["<concurrent-edit-after-drift-check>"],
+                         patches=patches, master_version=fresh_ver[m])
 
     return MergePlan(drifted=False, patches=patches, master_version=fresh_ver[m])
 
@@ -209,10 +228,14 @@ def commit_merge(
     observed = build_cluster(reader, m, sec)
     report = verify_merge(snapshot, observed, smart_fill=smart_fill)
     if not report.passed:
+        # OBS-4: record the verify FAIL so it enters the verify-pass-rate denominator.
+        prov.record(activity="commit_merge_verify", item_key=m, snapshot_id=snapshot.snapshot_id,
+                    agent="merge-engine", tool_version=__version__,
+                    params={"pass": False, "failed": [c.name for c in report.failed]})
         # M-3: master was PATCHed by merge_cluster, nothing trashed yet -> rollback state b (not just block).
         rb = rollback_merge(snapshot, observed, gateway, library_id=library_id, library_type=library_type)
-        return CommitResult(mode="rolled_back", verify_passed=False, rollback=rb,
-                            reason=f"verify failed: {[c.name for c in report.failed]}")
+        return CommitResult(mode=("rolled_back" if rb.ok else "rollback_failed"), verify_passed=False,
+                            rollback=rb, reason=f"verify failed: {[c.name for c in report.failed]}")
 
     # GATE (C-1 enable token): default SHADOW — verify passed, log it, NO trash.
     if not live_merge_enabled():
@@ -233,34 +256,40 @@ def commit_merge(
                          params={"secondaries": sec,
                                  "expected_versions": {k: observed.items[k].version for k in sec}})
 
-    # TRASH each secondary via PATCH deleted:1 (TRASH-NOT-PURGE), sequentially (gateway honors Backoff, M-5).
+    # TRASH each secondary via PATCH deleted:1 (TRASH-NOT-PURGE), sequentially (gateway honors Backoff).
+    # retry_on_412=False so a concurrent edit ABORTS to rollback (F6); the handler catches ANY failure
+    # (412, 5xx, transport drop) -> rollback the done subset (F1/M-5), not just ConcurrencyConflictError.
     trashed: list = []
     try:
         for k in sec:
             gateway.update_item(library_id, k, {"deleted": 1}, observed.items[k].version,
-                                library_type=library_type)
+                                library_type=library_type, retry_on_412=False)
             trashed.append(k)
-    except ConcurrencyConflictError as e:
-        # M-5: partial trash (412) -> rollback (untrash the done subset + revert master).
+    except Exception as e:
         post = build_cluster(reader, m, sec)
         rb = rollback_merge(snapshot, post, gateway, library_id=library_id, library_type=library_type)
-        return CommitResult(mode="rolled_back", trashed=trashed, rollback=rb, intent_prov_id=intent["prov_id"],
-                            reason=f"partial trash (412): {e}")
+        return CommitResult(mode=("rolled_back" if rb.ok else "rollback_failed"),
+                            trashed=trashed, rollback=rb, intent_prov_id=intent["prov_id"],
+                            reason=f"partial-trash failure -> rollback: {type(e).__name__}: {e}")
 
     # M-4: post-commit child re-assert (reader includes trashed children).
     post = build_cluster(reader, m, sec)
     if not _reassert_children(snapshot, post, gateway, library_id, library_type):
         rb = rollback_merge(snapshot, post, gateway, library_id=library_id, library_type=library_type)
-        return CommitResult(mode="rolled_back", trashed=trashed, rollback=rb, intent_prov_id=intent["prov_id"],
-                            reason="M-4 child re-assert failed")
+        return CommitResult(mode=("rolled_back" if rb.ok else "rollback_failed"), trashed=trashed,
+                            rollback=rb, intent_prov_id=intent["prov_id"], reason="M-4 child re-assert failed")
 
     # C-5: terminal verify of the FINAL state.
     final = build_cluster(reader, m, sec)
     terminal = _terminal_verify(snapshot, final, sec)
     if not terminal.passed:
+        # OBS-4: the terminal verify is a verify -> record its FAIL into the rate.
+        prov.record(activity="commit_merge_verify", item_key=m, snapshot_id=snapshot.snapshot_id,
+                    agent="merge-engine", tool_version=__version__,
+                    params={"pass": False, "failed": terminal.failed})
         rb = rollback_merge(snapshot, final, gateway, library_id=library_id, library_type=library_type)
-        return CommitResult(mode="rolled_back", trashed=trashed, rollback=rb, intent_prov_id=intent["prov_id"],
-                            reason=f"terminal verify failed: {terminal.failed}")
+        return CommitResult(mode=("rolled_back" if rb.ok else "rollback_failed"), trashed=trashed,
+                            rollback=rb, intent_prov_id=intent["prov_id"], reason=f"terminal verify failed: {terminal.failed}")
 
     # C-3: RESULT PROV (before/after blobs for the sampled audit).
     prov.record(activity="commit_merge", item_key=m, snapshot_id=snapshot.snapshot_id,

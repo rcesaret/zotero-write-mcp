@@ -49,7 +49,7 @@ class FakeLibrary:
         return None
 
     # ---- gateway ----
-    def update_item(self, library_id, item_key, data, version, *, library_type="user"):
+    def update_item(self, library_id, item_key, data, version, *, library_type="user", retry_on_412=True):
         it = self.items[item_key]
         self.lib_ver += 1
         it["data"].update(data)
@@ -175,10 +175,39 @@ class TrashFailLibrary(FakeLibrary):
         super().__init__(items)
         self.fail_key = fail_key
 
-    def update_item(self, library_id, item_key, data, version, *, library_type="user"):
+    def update_item(self, library_id, item_key, data, version, *, library_type="user", retry_on_412=True):
         if data.get("deleted") == 1 and item_key == self.fail_key:
             raise ConcurrencyConflictError(f"412 trashing {item_key}")
         return super().update_item(library_id, item_key, data, version, library_type=library_type)
+
+
+class TrashErrorLibrary(FakeLibrary):
+    """Raises a NON-412 GatewayError on a designated secondary's trash (a transient 5xx)."""
+
+    def __init__(self, items, fail_key):
+        super().__init__(items)
+        self.fail_key = fail_key
+
+    def update_item(self, library_id, item_key, data, version, *, library_type="user", retry_on_412=True):
+        if data.get("deleted") == 1 and item_key == self.fail_key:
+            from zotero_write_mcp.gateway import GatewayError
+            raise GatewayError(f"unexpected HTTP 503 trashing {item_key}")
+        return super().update_item(library_id, item_key, data, version, library_type=library_type)
+
+
+def test_f1_non_412_trash_failure_rolls_back(tmp_path, monkeypatch):
+    """F1 BLOCKER: a NON-412 GatewayError (transient 5xx) mid-trash must route to rollback, not escape."""
+    monkeypatch.setenv(ENABLE_ENV, ENABLE_TOKEN)
+    raw = {"M1": _i("M1", 1, "journalArticle", collections=["C1"], tags=[], relations={}, title="t"),
+           "S1": _i("S1", 2, "journalArticle", collections=["C2"], tags=[], relations={}, title="t"),
+           "S2": _i("S2", 3, "journalArticle", collections=["C3"], tags=[], relations={}, title="t")}
+    lib = TrashErrorLibrary(raw, fail_key="S2")
+    snap = snapshot_cluster(lib, "M1", ["S1", "S2"], prov=ProvenanceStore(tmp_path / "s"))
+    merge_cluster(snap, lib, lib, library_id=11056739)
+    res = commit_merge(snap, lib, lib, _fresh_prov(tmp_path), library_id=11056739, now=NOW)
+    assert res.mode == "rolled_back"                              # not an uncaught exception
+    assert res.trashed == ["S1"]                                  # S1 trashed before S2's 503
+    assert lib.items["S1"]["data"].get("deleted") in (None, 0)    # rollback un-trashed S1
 
 
 def test_m5_partial_trash_rolls_back(tmp_path, monkeypatch):
@@ -208,7 +237,7 @@ class CascadeLibrary(FakeLibrary):
         self.cascade_child = cascade_child
         self._done = False
 
-    def update_item(self, library_id, item_key, data, version, *, library_type="user"):
+    def update_item(self, library_id, item_key, data, version, *, library_type="user", retry_on_412=True):
         super().update_item(library_id, item_key, data, version, library_type=library_type)
         if data.get("deleted") == 1 and item_key == "M2" and not self._done:
             self._done = True

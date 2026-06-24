@@ -28,8 +28,8 @@ class FakeGateway:
     def __init__(self):
         self.calls = []
 
-    def update_item(self, library_id, item_key, data, version, *, library_type="user"):
-        self.calls.append({"key": item_key, "data": data, "version": version})
+    def update_item(self, library_id, item_key, data, version, *, library_type="user", retry_on_412=True):
+        self.calls.append({"key": item_key, "data": data, "version": version, "retry_on_412": retry_on_412})
 
 
 def _item(key, version, item_type="journalArticle", **data):
@@ -83,7 +83,25 @@ def test_merge_cluster_drift_aborts_no_writes(setup):
     gw = FakeGateway()
     plan = merge_cluster(snap, reader, gw, library_id=11056739)
     assert plan.drifted and "M2" in plan.drift_keys
-    assert gw.calls == []                       # NO writes on drift — caller re-snapshots
+    assert gw.calls == []                       # NO writes on drift
+
+
+def test_merge_cluster_child_drift_aborts(setup):
+    """MC-1: a concurrent edit to a CHILD (version bump) aborts even though the parent is unchanged."""
+    reader, snap = setup
+    reader._children["M2"][0]["version"] = 888  # A2 (child of M2) externally re-versioned
+    gw = FakeGateway()
+    plan = merge_cluster(snap, reader, gw, library_id=11056739)
+    assert plan.drifted and "A2" in plan.drift_keys
+    assert gw.calls == []
+
+
+def test_merge_cluster_patches_are_fail_closed(setup):
+    """M1/F6/MC-2: every merge PATCH is issued retry_on_412=False (abort-on-conflict, no blind re-apply)."""
+    reader, snap = setup
+    gw = FakeGateway()
+    merge_cluster(snap, reader, gw, library_id=11056739)
+    assert gw.calls and all(c["retry_on_412"] is False for c in gw.calls)
 
 
 def test_merge_cluster_no_smartfill_leaves_master_fields(setup):

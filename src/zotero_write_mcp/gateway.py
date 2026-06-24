@@ -257,8 +257,15 @@ class WriteGateway:
 
     # ── update (single PATCH, versioned, 412 re-GET + retry once) ───────────────
     def update_item(self, library_id: int, item_key: str, data: dict,
-                    version: Optional[int], *, library_type: str = "user") -> WriteResult:
-        """PATCH a single item. Requires ``version``; retries once on 412 with the fresh version.
+                    version: Optional[int], *, library_type: str = "user",
+                    retry_on_412: bool = True) -> WriteResult:
+        """PATCH a single item. Requires ``version``.
+
+        ``retry_on_412`` (default True): on 412, re-GET the fresh version and retry once (the convenience
+        path for ordinary edits). **Destructive / merge-path PATCHes MUST pass ``retry_on_412=False``** so a
+        412 surfaces immediately as :class:`ConcurrencyConflictError` — the blind re-GET+retry would
+        otherwise re-apply a STALE body over a concurrent edit, silently defeating the merge's
+        abort-on-conflict guarantee (Phase-2 review F6 / MC-2; "412 → rollback", merge-safety.md).
 
         Default to PATCH (omitted scalars untouched). Array properties (collections/tags/creators/
         relations) are complete-list replaces — callers pre-compute the union; the gateway does not
@@ -270,6 +277,10 @@ class WriteGateway:
         prefix = library_prefix(library_type, library_id)
         resp = self._patch_once(prefix, item_key, data, version)
         if resp.status_code == 412:
+            if not retry_on_412:
+                raise ConcurrencyConflictError(
+                    f"update_item({item_key}) 412 with retry_on_412=False; the item changed under the "
+                    "merge — caller must re-snapshot / route to rollback (no blind re-apply).")
             fresh = self._current_item_version(prefix, item_key)
             resp = self._patch_once(prefix, item_key, data, fresh)
             if resp.status_code == 412:

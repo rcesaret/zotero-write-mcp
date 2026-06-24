@@ -18,6 +18,8 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from zotero_write_mcp.merge import _NON_SCALAR_FIELDS
+
 _PUNCT = re.compile(r"[^\w\s]", re.UNICODE)
 _WS = re.compile(r"\s+")
 _YEAR = re.compile(r"\b(1[0-9]{3}|2[0-9]{3})\b")
@@ -41,6 +43,38 @@ def normalize_title(title: Any) -> str:
     t = str(title).split(":", 1)[0]
     t = _PUNCT.sub(" ", _strip_diacritics(t).lower())
     return _WS.sub(" ", t).strip()
+
+
+_STOPWORDS = frozenset(
+    "a an the of and or in on for to with by from as at into over under after before is are".split())
+TITLE_JACCARD_FLOOR = 0.5   # below this on FULL-title content tokens -> different works -> demote to review
+
+
+def normalize_title_full(title: Any) -> str:
+    """Full normalized title WITHOUT dropping the subtitle — the discriminator for the auto-accept paths
+    (review B2 / DEDUP-3): two works sharing a subtitle-stripped key, or a coincidentally-shared DOI, but
+    differing in their full titles must NOT auto-merge."""
+    if not title:
+        return ""
+    return _WS.sub(" ", _PUNCT.sub(" ", _strip_diacritics(str(title)).lower())).strip()
+
+
+def _content_tokens(title_norm: str) -> set:
+    return {t for t in title_norm.split() if t not in _STOPWORDS}
+
+
+def _min_title_jaccard(by_key: dict, keys: list) -> float:
+    """Minimum pairwise Jaccard over FULL-title content tokens (stopwords stripped). 1.0 if < 2 titles —
+    a single shared stopword no longer defeats the guard (DEDUP-3)."""
+    sets = [s for s in (_content_tokens(normalize_title_full(_data(by_key[k]).get("title"))) for k in keys) if s]
+    if len(sets) < 2:
+        return 1.0
+    worst = 1.0
+    for i in range(len(sets)):
+        for j in range(i + 1, len(sets)):
+            union = sets[i] | sets[j]
+            worst = min(worst, (len(sets[i] & sets[j]) / len(union)) if union else 1.0)
+    return worst
 
 
 def normalize_year(item: Any) -> str:
@@ -84,7 +118,11 @@ def _item_type(item: Any) -> Any:
 
 
 def _completeness(item: Any) -> int:
-    return sum(1 for v in _data(item).values() if v not in (None, "", [], {}))
+    """Count non-empty BIBLIOGRAPHIC scalar fields only (DEDUP-2): collections/tags/relations/timestamps/
+    version/key are excluded so a sparse record that merely sits in more collections cannot outrank a
+    metadata-rich one for master selection."""
+    return sum(1 for k, v in _data(item).items()
+               if k not in _NON_SCALAR_FIELDS and v not in (None, "", [], {}))
 
 
 def select_master(by_key: dict, keys: list) -> str:
@@ -164,34 +202,23 @@ def dedup_scan(items: list, *, review_threshold: float = 0.99) -> dict:
     }
 
 
-def _gross_title_disagreement(by_key: dict, keys: list) -> bool:
-    """GROSS (H-3): two normalized titles share NO tokens — suggests a DOI reused across unrelated works.
-    A minor diff (e.g. 'Paper' vs 'Paper (reprint)', which share the token 'paper') is NOT gross."""
-    token_sets = [set(normalize_title(_data(by_key[k]).get("title")).split()) for k in keys]
-    token_sets = [s for s in token_sets if s]
-    for i in range(len(token_sets)):
-        for j in range(i + 1, len(token_sets)):
-            if not (token_sets[i] & token_sets[j]):
-                return True
-    return False
-
-
 def _conflicts(by_key: dict, keys: list, *, path: str) -> list:
-    """Hard conflicts that DEMOTE an otherwise-deterministic cluster to human review (H-3).
+    """Hard conflicts that DEMOTE an otherwise-deterministic cluster to human review.
 
-    ``path="doi"``: items share an exact DOI; demote on item-type / year / GROSS-title disagreement.
-    ``path="key"``: items share an exact normalized key (title+year identical by construction); demote on
-    item-type conflict or a conflicting non-null DOI (different DOIs -> different works)."""
+    BOTH paths apply a FULL-title content-token Jaccard floor (review B2 + DEDUP-3): the subtitle-drop in
+    the normalized key, and the old zero-token-overlap gross check, were too weak — two genuinely different
+    works could share a DOI (typo/reuse) or a subtitle-stripped key and auto-merge. ``path="doi"``
+    additionally demotes on a year disagreement; ``path="key"`` on a conflicting non-null DOI."""
     out: list = []
     if len({_item_type(by_key[k]) for k in keys}) > 1:
         out.append("item-type conflict")
+    if _min_title_jaccard(by_key, keys) < TITLE_JACCARD_FLOOR:
+        out.append("title disagreement")
     if path == "doi":
         years = {normalize_year(by_key[k]) for k in keys}
         years.discard("")
         if len(years) > 1:
             out.append("year disagreement")
-        if _gross_title_disagreement(by_key, keys):
-            out.append("gross title disagreement")
     elif path == "key":
         dois = {normalize_doi(by_key[k]) for k in keys}
         dois.discard(None)
