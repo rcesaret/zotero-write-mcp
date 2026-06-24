@@ -456,10 +456,13 @@ def compute_merge_projection(
 
 @dataclass
 class RestoreReport:
-    """Outcome of a rollback. ``state`` ∈ {"a","b","c"}; ``operations`` is the executed restore plan."""
+    """Outcome of a rollback. ``state`` ∈ {"a","b","c"}; ``operations`` = the restore ops that SUCCEEDED;
+    ``failures`` = restore ops that threw. ``ok`` is False when any op failed — the caller MUST escalate
+    (a partial rollback leaves a half-restored library that needs human recovery, review R-3)."""
     state: str
-    operations: list                  # [{op, key, ...}]
+    operations: list                  # [{op, key, ...}] — succeeded
     ok: bool = True
+    failures: list = field(default_factory=list)   # [{op, key, error}]
 
 
 class RollbackGateway(Protocol):
@@ -528,34 +531,44 @@ def rollback_merge(
         return RestoreReport(state="a", operations=[], ok=True)
 
     state = "c" if (trashed or absent) else "b"
+    failures: list = []
+
+    def _do(op: dict, fn) -> None:
+        # R-3: each restore op is independently fail-safe — a thrown gateway error (412/5xx) is recorded,
+        # not propagated, so a partial rollback returns ok=False (loudly escalated) instead of an uncaught
+        # exception that hides a half-restored library.
+        try:
+            fn()
+            ops.append(op)
+        except Exception as e:
+            failures.append({**op, "error": f"{type(e).__name__}: {e}"})
 
     # (c) restore secondaries FIRST (so children have a parent to return to)
     for k in trashed:
-        gateway.update_item(library_id, k, {"deleted": 0}, observed.items[k].version,
-                            library_type=library_type)
-        ops.append({"op": "untrash", "key": k})
+        _do({"op": "untrash", "key": k},
+            lambda k=k: gateway.update_item(library_id, k, {"deleted": 0}, observed.items[k].version,
+                                            library_type=library_type))
     for k in absent:
-        # PHASE-2-INCOMPLETE: re-creating a hard-gone secondary needs version:0 (and is valid only if the
-        # item was PURGED, not trashed). Under "trash, never purge" a secondary is trashed (deleted:1) and
-        # takes the un-trash path above; this absent->recreate branch is a defensive stub that must zero
-        # version / strip server-managed keys per the Web API contract before live rollback (Phase 2).
-        gateway.create_items(library_id, [snapshot.items[k].json], library_type=library_type)
-        ops.append({"op": "recreate", "key": k})
+        # PHASE-2-INCOMPLETE: re-creating a hard-gone secondary needs version:0 (valid only if PURGED, not
+        # trashed). Under "trash, never purge" a secondary is trashed and takes the un-trash path above;
+        # this absent->recreate branch is a defensive stub to harden before live rollback.
+        _do({"op": "recreate", "key": k},
+            lambda k=k: gateway.create_items(library_id, [snapshot.items[k].json], library_type=library_type))
 
     # (b) revert master scalar/array fields, then re-parent children to their original parents
     if obs_m is not None and master_changed:
         revert = {**sm.fields, "collections": sm.collections,
                   "tags": _zotero_tags(sm.tags), "relations": sm.relations}
-        gateway.update_item(library_id, m, revert, obs_m.version, library_type=library_type)
-        ops.append({"op": "revert-master", "key": m})
+        _do({"op": "revert-master", "key": m},
+            lambda: gateway.update_item(library_id, m, revert, obs_m.version, library_type=library_type))
 
     for c in reparented:
         oc = obs_children[c.key]
-        gateway.update_item(library_id, c.key, {"parentItem": c.parent_key}, oc.version,
-                            library_type=library_type)
-        ops.append({"op": "reparent", "key": c.key, "to": c.parent_key})
+        _do({"op": "reparent", "key": c.key, "to": c.parent_key},
+            lambda c=c, oc=oc: gateway.update_item(library_id, c.key, {"parentItem": c.parent_key},
+                                                   oc.version, library_type=library_type))
 
-    return RestoreReport(state=state, operations=ops, ok=True)
+    return RestoreReport(state=state, operations=ops, ok=(not failures), failures=failures)
 
 
 # ── shadow_merge — compute + verify + log, NO commit (TC-3 shadow; ADR-004) ─────

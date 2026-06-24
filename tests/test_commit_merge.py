@@ -254,3 +254,67 @@ def test_m4_cascade_child_reasserted(tmp_path, monkeypatch):
     assert lib.items["M2"]["data"]["deleted"] == 1            # secondary trashed
     assert lib.items["N1"]["data"].get("deleted") in (None, 0)  # M-4 re-asserted the cascade-trashed child
     assert lib.items["N1"]["data"]["parentItem"] == "M1"
+
+
+# ── F5: a concurrent master edit during the trash window is caught by the terminal verify ───
+
+class MasterEditLibrary(FakeLibrary):
+    """When M2 is trashed, an external actor concurrently drops M1 from a collection (the union)."""
+
+    def __init__(self, items):
+        super().__init__(items)
+        self._done = False
+
+    def update_item(self, library_id, item_key, data, version, *, library_type="user", retry_on_412=True):
+        super().update_item(library_id, item_key, data, version, library_type=library_type)
+        if data.get("deleted") == 1 and item_key == "M2" and not self._done:
+            self._done = True
+            self.items["M1"]["data"]["collections"] = ["C1"]        # drop the unioned C2 mid-commit
+
+
+def test_f5_concurrent_master_edit_rolls_back(tmp_path, monkeypatch):
+    monkeypatch.setenv(ENABLE_ENV, ENABLE_TOKEN)
+    lib = MasterEditLibrary(make_raw())
+    snap = snapshot_cluster(lib, "M1", ["M2"], prov=ProvenanceStore(tmp_path / "s"))
+    merge_cluster(snap, lib, lib, library_id=11056739)
+    res = commit_merge(snap, lib, lib, _fresh_prov(tmp_path), library_id=11056739, now=NOW)
+    assert res.mode in ("rolled_back", "rollback_failed")
+    assert "master-collections" in res.reason                       # terminal verify caught the master edit
+
+
+# ── M-4-disjoint: overlapping in-flight cluster is serialized ───
+
+def test_m4_disjoint_blocks_overlapping_inflight(tmp_path, monkeypatch):
+    from zotero_write_mcp.merge_live import _acquire_cluster, _release_cluster
+    monkeypatch.setenv(ENABLE_ENV, ENABLE_TOKEN)
+    lib = FakeLibrary(make_raw())
+    snap = _snap_and_merge(lib, tmp_path)
+    _acquire_cluster(["M2"])                                        # another in-flight commit holds M2
+    try:
+        res = commit_merge(snap, lib, lib, _fresh_prov(tmp_path), library_id=11056739, now=NOW)
+        assert res.mode == "blocked" and "disjoint" in res.reason
+    finally:
+        _release_cluster(["M2"])
+    res2 = commit_merge(snap, lib, lib, _fresh_prov(tmp_path), library_id=11056739, now=NOW)
+    assert res2.mode == "committed"                                  # proceeds once the claim is released
+
+
+# ── R-3: a rollback whose own op fails escalates to mode='rollback_failed' ───
+
+class RevertFailLibrary(FakeLibrary):
+    """Fails the rollback's revert-master PATCH (which carries scalar fields like 'title')."""
+
+    def update_item(self, library_id, item_key, data, version, *, library_type="user", retry_on_412=True):
+        if "title" in data and item_key == "M1":      # only rollback's revert-master carries title
+            raise ConcurrencyConflictError("revert-master 412")
+        return super().update_item(library_id, item_key, data, version, library_type=library_type)
+
+
+def test_r3_rollback_failure_escalates(tmp_path, monkeypatch):
+    monkeypatch.setenv(ENABLE_ENV, ENABLE_TOKEN)
+    lib = RevertFailLibrary(make_raw())
+    snap = _snap_and_merge(lib, tmp_path)
+    lib.items["M1"]["data"]["collections"] = ["C1"]    # corrupt -> pre-trash verify fails -> rollback (revert-master)
+    res = commit_merge(snap, lib, lib, _fresh_prov(tmp_path), library_id=11056739, now=NOW)
+    assert res.mode == "rollback_failed"               # not an uncaught exception, not a clean rollback
+    assert res.rollback is not None and res.rollback.ok is False and res.rollback.failures

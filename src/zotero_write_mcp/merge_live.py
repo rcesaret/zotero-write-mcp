@@ -12,6 +12,7 @@ reader + fake gateway; no live writes occur in tests.
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -20,7 +21,7 @@ from zotero_write_mcp import __version__
 from zotero_write_mcp.gateway import ConcurrencyConflictError, library_prefix
 from zotero_write_mcp.merge import (
     ClusterSnapshot, RestoreReport, build_cluster, compute_merge_projection, rollback_merge,
-    verify_merge, _is_empty, _is_trashed, _unwrap, _zotero_tags,
+    verify_merge, _as_list, _is_empty, _is_trashed, _unwrap, _zotero_tags,
 )
 from zotero_write_mcp.observability import observability_is_fresh
 from zotero_write_mcp.provenance import ProvenanceStore
@@ -165,10 +166,12 @@ def _reassert_children(snapshot, post, gateway, library_id, library_type) -> boo
     return True
 
 
-def _terminal_verify(snapshot, final, sec_keys) -> TerminalReport:
+def _terminal_verify(snapshot, final, sec_keys, *, library_base, smart_fill=False) -> TerminalReport:
     """C-5: scoped re-verify of the FINAL committed state (the full 11-check verify cannot run here — the
     secondaries' versions legitimately changed via the trash). Asserts: every child live + parented to
-    master; annotation parity + storage integrity per attachment; every secondary present AND trashed."""
+    master; annotation parity + storage integrity per attachment; every secondary present AND trashed;
+    AND (F5) the MASTER still matches the merge projection — a concurrent external edit to the master
+    during the trash window passes the child/secondary checks but is a silent lossy merge."""
     m = snapshot.master_key
     failed: list = []
     final_children = {c.key: c for c in (final.notes + final.attachments)}
@@ -190,10 +193,76 @@ def _terminal_verify(snapshot, final, sec_keys) -> TerminalReport:
         si = final.items.get(k)
         if si is None or not _is_trashed(si):
             failed.append(f"secondary-not-trashed:{k}")
+    # F5: the master must still match the merge projection (collections/tags/relations + scalar fields).
+    proj_m = compute_merge_projection(snapshot, smart_fill=smart_fill, library_base=library_base).items[m]
+    fm = final.items.get(m)
+    if fm is None:
+        failed.append("master-absent")
+    else:
+        if set(fm.collections) != set(proj_m.collections):
+            failed.append("master-collections")
+        if {tuple(t) for t in proj_m.tags} - {tuple(t) for t in fm.tags}:
+            failed.append("master-tags")
+        for pred, vals in proj_m.relations.items():
+            if not set(_as_list(vals)) <= set(_as_list(fm.relations.get(pred))):
+                failed.append("master-relations")
+                break
+        for fk, v in snapshot.items[m].fields.items():
+            if not _is_empty(v) and fm.fields.get(fk) != v:
+                failed.append(f"master-field:{fk}")
+                break
     return TerminalReport(not failed, failed)
 
 
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT_KEYS: set = set()
+
+
+def _acquire_cluster(keys: list) -> bool:
+    """M-4-disjoint: claim a cluster's item keys; refuse if any key is already in another in-flight
+    commit (a COMPUTATIONAL serialization guard — not LLM-agent prose, per the safety-is-computational
+    doctrine). The engine is single-process, so a lock + set suffices."""
+    with _INFLIGHT_LOCK:
+        if any(k in _INFLIGHT_KEYS for k in keys):
+            return False
+        _INFLIGHT_KEYS.update(keys)
+        return True
+
+
+def _release_cluster(keys: list) -> None:
+    with _INFLIGHT_LOCK:
+        _INFLIGHT_KEYS.difference_update(keys)
+
+
 def commit_merge(
+    snapshot: ClusterSnapshot,
+    reader: Any,
+    gateway: Any,
+    prov: ProvenanceStore,
+    *,
+    library_id: int,
+    library_type: str = "user",
+    smart_fill: bool = False,
+    now: Optional[datetime] = None,
+    ceiling: int = DEFAULT_CEILING,
+    freshness_window: float = DEFAULT_FRESHNESS_WINDOW,
+) -> CommitResult:
+    """M-4-disjoint serialization wrapper: claim the cluster's item keys so two overlapping clusters
+    cannot be committed concurrently (a destructive op on a shared item must serialize), then delegate to
+    the fail-closed inner commit. Releases the claim in ``finally``."""
+    cluster_keys = [snapshot.master_key, *snapshot.secondary_keys]
+    if not _acquire_cluster(cluster_keys):
+        return CommitResult(mode="blocked",
+                            reason="cluster shares an item with another in-flight commit (M-4-disjoint)")
+    try:
+        return _commit_merge_inner(
+            snapshot, reader, gateway, prov, library_id=library_id, library_type=library_type,
+            smart_fill=smart_fill, now=now, ceiling=ceiling, freshness_window=freshness_window)
+    finally:
+        _release_cluster(cluster_keys)
+
+
+def _commit_merge_inner(
     snapshot: ClusterSnapshot,
     reader: Any,
     gateway: Any,
@@ -281,7 +350,9 @@ def commit_merge(
 
     # C-5: terminal verify of the FINAL state.
     final = build_cluster(reader, m, sec)
-    terminal = _terminal_verify(snapshot, final, sec)
+    terminal = _terminal_verify(snapshot, final, sec,
+                                library_base=library_item_base(library_type, library_id),
+                                smart_fill=smart_fill)
     if not terminal.passed:
         # OBS-4: the terminal verify is a verify -> record its FAIL into the rate.
         prov.record(activity="commit_merge_verify", item_key=m, snapshot_id=snapshot.snapshot_id,
