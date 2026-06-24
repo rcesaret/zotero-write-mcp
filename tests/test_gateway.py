@@ -186,3 +186,116 @@ def test_delete_items_rejects_oversized_batch():
     gw = WriteGateway(FakeTransport([]))
     with pytest.raises(GatewayError):
         gw.delete_items(1, [f"K{i}" for i in range(BATCH_LIMIT + 1)], version=1)
+
+
+# ── rate governor: Backoff / Retry-After (P0-batch-concurrency) ────────────────
+
+def test_governor_waits_out_backoff_before_next_request():
+    sleeps = []
+    t = FakeTransport([
+        FakeResp(200, body={}, headers={"Backoff": "5"}),  # server asks us to pause
+        FakeResp(200, body={}),
+    ])
+    gw = WriteGateway(t, sleep=sleeps.append, monotonic=lambda: 0.0)
+    gw.create_items(1, [{"itemType": "book"}])   # response sets resume_at = 0 + 5
+    gw.create_items(1, [{"itemType": "book"}])   # must wait ~5 before sending
+    assert sleeps == [5.0]
+
+
+def test_governor_retries_on_429_honoring_retry_after():
+    sleeps = []
+    t = FakeTransport([
+        FakeResp(429, headers={"Retry-After": "3"}),
+        FakeResp(200, body={"success": {"0": "AAAA1111"}}),
+    ])
+    gw = WriteGateway(t, sleep=sleeps.append, monotonic=lambda: 0.0)
+    r = gw.create_items(1, [{"itemType": "book"}])
+    assert sleeps == [3]
+    assert len(t.calls) == 2
+    assert r.item_keys == ["AAAA1111"]
+
+
+# ── chunking + merge (P0-batch-concurrency) ───────────────────────────────────
+
+def test_create_items_chunked_splits_and_merges_in_order():
+    t = FakeTransport([
+        FakeResp(200, body={"success": {"0": "K0", "1": "K1"}}, headers={"Last-Modified-Version": "201"}),
+        FakeResp(200, body={"success": {"0": "K2", "1": "K3"}}, headers={"Last-Modified-Version": "203"}),
+        FakeResp(200, body={"success": {"0": "K4"}}, headers={"Last-Modified-Version": "205"}),
+    ])
+    gw = WriteGateway(t, batch_limit=2)
+    objs = [{"n": i} for i in range(5)]
+    r = gw.create_items_chunked(1, objs)
+    assert [c["method"] for c in t.calls] == ["POST", "POST", "POST"]   # 3 chunks of 2,2,1
+    assert r.item_keys == ["K0", "K1", "K2", "K3", "K4"]
+    assert r.last_modified_version == 205   # last chunk's version
+
+
+def test_create_items_chunked_reindexes_failures_to_global_positions():
+    t = FakeTransport([
+        FakeResp(200, body={"success": {"0": "KA"}, "failed": {"1": {"code": 412}}}),
+        FakeResp(200, body={"success": {"0": "KC"}, "failed": {"1": {"code": 400}}}),
+    ])
+    gw = WriteGateway(t, batch_limit=2)
+    objs = [{"id": "a"}, {"id": "b"}, {"id": "c"}, {"id": "d"}]
+    r = gw.create_items_chunked(1, objs)
+    assert r.failed_indices == [1, 3]                       # b (chunk0[1]) and d (chunk1[1]=global 3)
+    assert r.failed_objects(objs) == [{"id": "b"}, {"id": "d"}]
+
+
+# ── partial-failure retry (P0-partial-retry) ──────────────────────────────────
+
+def test_resubmit_failed_resubmits_only_the_failed_inputs():
+    submit = FakeTransport([FakeResp(200, body={"success": {"0": "NEWKEY"}})])
+    gw = WriteGateway(submit, batch_limit=50)
+    objs = [{"id": "a"}, {"id": "b"}, {"id": "c"}]
+    prior = WriteResult(status_code=200, failed={"1": {"code": 412}})  # only b failed
+    r = gw.resubmit_failed(1, objs, prior)
+    # exactly one POST, carrying ONLY the failed object b
+    assert len(submit.calls) == 1
+    assert submit.calls[0]["json"] == [{"id": "b"}]
+    assert r.item_keys == ["NEWKEY"]
+
+
+def test_resubmit_failed_is_noop_when_nothing_failed():
+    t = FakeTransport([])
+    gw = WriteGateway(t)
+    r = gw.resubmit_failed(1, [{"id": "a"}], WriteResult(status_code=200))
+    assert r.all_ok and not t.calls
+
+
+# ── PUT guard (P0-put-guard) ──────────────────────────────────────────────────
+
+def test_replace_item_forbidden_without_complete_object_flag():
+    t = FakeTransport([])
+    gw = WriteGateway(t)
+    with pytest.raises(GatewayError):
+        gw.replace_item(1, "AAAA1111", {"itemType": "book"})  # complete_object defaults False
+    assert not t.calls   # never touched the API
+
+
+def test_replace_item_with_flag_regets_then_puts_with_fresh_version():
+    t = FakeTransport([
+        FakeResp(200, body={"version": 9}),                       # re-GET fresh version
+        FakeResp(204, headers={"Last-Modified-Version": "10"}),  # PUT succeeds
+    ])
+    gw = WriteGateway(t)
+    r = gw.replace_item(1, "AAAA1111", {"itemType": "book", "title": "Full"}, complete_object=True)
+    assert [c["method"] for c in t.calls] == ["GET", "PUT"]
+    assert t.calls[1]["headers"]["If-Unmodified-Since-Version"] == "9"   # used the fresh version
+    assert r.last_modified_version == 10
+
+
+# ── delete chunking threads the version forward ───────────────────────────────
+
+def test_delete_items_chunked_threads_library_version():
+    t = FakeTransport([
+        FakeResp(204, headers={"Last-Modified-Version": "101"}),
+        FakeResp(204, headers={"Last-Modified-Version": "102"}),
+    ])
+    gw = WriteGateway(t, batch_limit=2)
+    r = gw.delete_items_chunked(1, ["k0", "k1", "k2"], version=100)
+    assert t.calls[0]["headers"]["If-Unmodified-Since-Version"] == "100"
+    assert t.calls[1]["headers"]["If-Unmodified-Since-Version"] == "101"   # advanced after chunk 1
+    assert r.item_keys == ["k0", "k1", "k2"]
+    assert r.last_modified_version == 102
