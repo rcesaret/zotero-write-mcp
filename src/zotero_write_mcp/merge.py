@@ -142,20 +142,21 @@ def _safe_citekey(reader: ClusterReader, key: str) -> Optional[str]:
         return None  # citekey read is best-effort; #11 only requires master's, fetched again at verify
 
 
-def snapshot_cluster(
+def build_cluster(
     reader: ClusterReader,
     master_key: str,
     secondary_keys: list,
-    *,
-    prov: ProvenanceStore,
     snapshot_id: Optional[str] = None,
 ) -> ClusterSnapshot:
-    """Capture the full before-image of a cluster and persist it (append-only) to the PROV store.
+    """Read a cluster's current state into a :class:`ClusterSnapshot` — **pure** (NO PROV write).
 
-    Reads master + every secondary at their **current version**, plus all children (notes +
-    attachments) and annotation grandchildren under each attachment, plus per-attachment md5+filename
-    and pinned citekeys. Returns the :class:`ClusterSnapshot`; its ``snapshot_id`` is the rollback
-    index and the audit ``wasDerivedFrom`` (ADR-008).
+    Reads master + every secondary at their current version, all children (notes + attachments) and
+    annotation grandchildren, per-attachment md5+filename, and pinned citekeys. Used by
+    :func:`snapshot_cluster` (which then persists the result) AND by the Phase-2 live re-reads in
+    ``merge_live`` (verify / M-4 re-assert / terminal verify), which must NOT append a PROV record on
+    every internal re-read. Each child keeps its full ``json`` (incl. any ``deleted`` flag), so a
+    commit-time reader that includes trashed children lets M-4 / the terminal verify detect a
+    cascade-trashed child.
     """
     sid = snapshot_id or uuid.uuid4().hex
     items: dict = {}
@@ -182,21 +183,33 @@ def snapshot_cluster(
                 ))
             # other child types (rare) are captured by neither bucket by design; extend if needed.
 
-    snap = ClusterSnapshot(
+    return ClusterSnapshot(
         snapshot_id=sid, master_key=master_key, secondary_keys=list(secondary_keys),
         items=items, notes=notes, attachments=attachments,
     )
 
-    # Persist the before-image: PROV record + reversible blob (snapshot_id = wasDerivedFrom = rollback idx).
+
+def snapshot_cluster(
+    reader: ClusterReader,
+    master_key: str,
+    secondary_keys: list,
+    *,
+    prov: ProvenanceStore,
+    snapshot_id: Optional[str] = None,
+) -> ClusterSnapshot:
+    """Capture + PERSIST the full before-image of a cluster (append-only PROV blob). Thin wrapper over
+    :func:`build_cluster`; the ``snapshot_id`` is the rollback index and the audit ``wasDerivedFrom``
+    (ADR-008)."""
+    snap = build_cluster(reader, master_key, secondary_keys, snapshot_id)
     prov.record(
         activity="snapshot_cluster",
         item_key=master_key,
         before=snap.to_json(),
-        snapshot_id=sid,
+        snapshot_id=snap.snapshot_id,
         agent="merge-engine",
         tool_version=__version__,
         params={"master_key": master_key, "secondary_keys": list(secondary_keys),
-                "n_notes": len(notes), "n_attachments": len(attachments)},
+                "n_notes": len(snap.notes), "n_attachments": len(snap.attachments)},
     )
     return snap
 
