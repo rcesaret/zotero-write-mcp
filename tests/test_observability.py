@@ -44,10 +44,29 @@ def test_daily_report_metrics(tmp_path):
     assert rep["verify_total"] == 2 and rep["verify_passed"] == 1
     assert rep["verify_pass_rate"] == 0.5
     assert rep["merges_committed"] == 1
-    assert rep["status"] == "ok"
+    assert rep["status"] == "degraded"                                    # F3: 0.5 < default floor 1.0
+    assert rep["pass_rate_floor"] == 1.0
     assert len(rep["sampled_audit"]) == 1 and rep["sampled_audit"][0]["item_key"] == "M1"
     assert rep["sampled_audit"][0]["after_blob"]                          # audit can reconstruct the merge
     assert latest_daily_report(p)["activity"] == "daily_report"           # marker persisted
+
+
+def test_daily_report_clean_is_ok(tmp_path):
+    """All recent verifies pass -> rate 1.0 -> status ok."""
+    p = ProvenanceStore(tmp_path)
+    p.record(activity="shadow_merge", item_key="A", params={"pass": True}, ts="2026-06-24T10:00:00+00:00")
+    p.record(activity="commit_merge", item_key="B", params={"pass": True}, ts="2026-06-24T10:01:00+00:00")
+    rep = daily_report(p, ts="2026-06-24T12:00:00+00:00")
+    assert rep["verify_pass_rate"] == 1.0 and rep["status"] == "ok"
+
+
+def test_freshness_rejects_degraded_report(tmp_path):
+    """F3/C-2: a report that RAN but recorded a sub-floor verify-pass-rate is degraded -> NOT fresh
+    (so commit_merge fails closed even though the report is recent)."""
+    p = _seed(tmp_path)                                                   # rate 0.5
+    daily_report(p, ts="2026-06-24T12:00:00+00:00")                       # default floor 1.0 -> degraded
+    now = datetime(2026, 6, 24, 12, 1, tzinfo=timezone.utc)
+    assert not observability_is_fresh(p, window_seconds=48 * 3600, now=now)
 
 
 def test_daily_report_no_verifies(tmp_path):
@@ -57,7 +76,7 @@ def test_daily_report_no_verifies(tmp_path):
 
 def test_freshness_fresh_then_stale(tmp_path):
     p = _seed(tmp_path)
-    daily_report(p, ts="2026-06-24T12:00:00+00:00")
+    daily_report(p, ts="2026-06-24T12:00:00+00:00", pass_rate_floor=0.0)  # floor 0 -> ok (isolate age logic)
     fresh_now = datetime(2026, 6, 24, 12, 30, tzinfo=timezone.utc)        # 30 min old
     assert observability_is_fresh(p, window_seconds=48 * 3600, now=fresh_now)
     stale_now = datetime(2026, 6, 27, 13, 0, tzinfo=timezone.utc)         # ~3 days old

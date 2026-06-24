@@ -52,25 +52,34 @@ def query_provenance(prov: ProvenanceStore, item_key: str) -> list:
     return [_history_entry(r) for r in prov.query(item_key)]
 
 
+# Activities that carry a real verify verdict (`params.pass`). The verify-pass-rate is computed ONLY over
+# these (OBS-4): "any record with a pass key" would silently pool unrelated activities and could be inflated
+# by a future activity that happens to set params.pass.
+VERIFY_ACTIVITIES = frozenset({"shadow_merge", "commit_merge", "commit_merge_shadow", "commit_merge_verify"})
+
+
 def _has_pass(r: dict) -> bool:
     p = r.get("params")
     return isinstance(p, dict) and "pass" in p
 
 
-def daily_report(prov: ProvenanceStore, *, sample_size: int = 10, ts: Optional[str] = None) -> dict:
-    """Compute the Phase-2 gate metrics from PROV and append a `daily_report` marker (the freshness
-    artifact). The ONLY write is the marker append (no Zotero mutation).
+def daily_report(prov: ProvenanceStore, *, sample_size: int = 10, ts: Optional[str] = None,
+                 pass_rate_floor: float = 1.0) -> dict:
+    """Compute the Phase-2 gate metrics from PROV and append a `daily_report` marker (the freshness +
+    HEALTH artifact). The ONLY write is the marker append (no Zotero mutation).
 
-    Metrics: verify-pass-rate (records carrying a `params.pass` verdict — shadow_merge + commit verifies),
-    merges-committed (`commit_merge` records), a sampled audit (commit before/after blob digests for human
-    side-by-side), and PROV coverage. `status` is "ok"; `commit_merge`'s gate refuses to fire on a stale
-    or non-ok report.
+    `status` is **"degraded"** when the recent verify-pass-rate is below `pass_rate_floor` (default 1.0 —
+    the Phase-2 exit gate demands 100% verify-pass), else "ok". `observability_is_fresh` rejects a non-ok
+    marker, so a report that RUNS but records bad health blocks live commits (F3/C-2: the gate must detect a
+    SICK library, not only a DEAD report job). A `None` rate (no recent verifies) is "ok" — the per-commit
+    verify still gates each merge.
     """
     recs = prov.all_records()
-    verifies = [r for r in recs if _has_pass(r)]
+    verifies = [r for r in recs if r.get("activity") in VERIFY_ACTIVITIES and _has_pass(r)]
     passed = [r for r in verifies if r["params"]["pass"] is True]
     commits = [r for r in recs if r.get("activity") == "commit_merge"]
     rate = (len(passed) / len(verifies)) if verifies else None
+    status = "degraded" if (rate is not None and rate < pass_rate_floor) else "ok"
 
     metrics = {
         "verify_pass_rate": rate,
@@ -78,7 +87,8 @@ def daily_report(prov: ProvenanceStore, *, sample_size: int = 10, ts: Optional[s
         "verify_passed": len(passed),
         "merges_committed": len(commits),
         "prov_records": len(recs),
-        "status": "ok",
+        "pass_rate_floor": pass_rate_floor,
+        "status": status,
     }
     sampled_audit = [{
         "item_key": (r.get("entity") or {}).get("item_key"),

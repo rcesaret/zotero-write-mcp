@@ -20,8 +20,8 @@ from typing import Any, Optional
 from zotero_write_mcp import __version__
 from zotero_write_mcp.gateway import ConcurrencyConflictError, library_prefix
 from zotero_write_mcp.merge import (
-    ClusterSnapshot, RestoreReport, build_cluster, compute_merge_projection, rollback_merge,
-    verify_merge, _as_list, _is_empty, _is_trashed, _unwrap, _zotero_tags,
+    ClusterSnapshot, RestoreReport, build_cluster, cluster_snapshot_from_dict, compute_merge_projection,
+    rollback_merge, verify_merge, _as_list, _is_empty, _is_trashed, _unwrap, _zotero_tags,
 )
 from zotero_write_mcp.observability import observability_is_fresh
 from zotero_write_mcp.provenance import ProvenanceStore
@@ -319,11 +319,21 @@ def _commit_merge_inner(
         return CommitResult(mode="blocked", verify_passed=True,
                             reason="observability stale/absent — fail-closed (no fresh daily_report)")
 
+    # MC-3: record the intended smart_fill key/values so a server-dropped fill is auditable from PROV.
+    smart_filled: dict = {}
+    if smart_fill:
+        proj_m = compute_merge_projection(
+            snapshot, smart_fill=True, library_base=library_item_base(library_type, library_id)).items[m]
+        sm_fields = snapshot.items[m].fields
+        smart_filled = {k: v for k, v in proj_m.fields.items()
+                        if _is_empty(sm_fields.get(k)) and not _is_empty(v)}
+
     # C-3: INTENT PROV before any trash (a trashed-but-no-result secondary stays findable for rollback).
     intent = prov.record(activity="commit_merge_intent", item_key=m, snapshot_id=snapshot.snapshot_id,
                          agent="merge-engine", tool_version=__version__,
                          params={"secondaries": sec,
-                                 "expected_versions": {k: observed.items[k].version for k in sec}})
+                                 "expected_versions": {k: observed.items[k].version for k in sec},
+                                 "smart_fill": smart_fill, "smart_filled_fields": smart_filled})
 
     # TRASH each secondary via PATCH deleted:1 (TRASH-NOT-PURGE), sequentially (gateway honors Backoff).
     # retry_on_412=False so a concurrent edit ABORTS to rollback (F6); the handler catches ANY failure
@@ -334,6 +344,10 @@ def _commit_merge_inner(
             gateway.update_item(library_id, k, {"deleted": 1}, observed.items[k].version,
                                 library_type=library_type, retry_on_412=False)
             trashed.append(k)
+            # F4: a per-secondary durable record (not just the aggregate intent) so the PROV log reflects
+            # exactly which secondaries are actually trashed — the crash-recovery reconcile keys on this.
+            prov.record(activity="commit_merge_trashed", item_key=k, snapshot_id=snapshot.snapshot_id,
+                        agent="merge-engine", tool_version=__version__, params={"trashed": True})
     except Exception as e:
         post = build_cluster(reader, m, sec)
         rb = rollback_merge(snapshot, post, gateway, library_id=library_id, library_type=library_type)
@@ -369,3 +383,43 @@ def _commit_merge_inner(
                 params={"pass": True, "trashed": trashed})
     return CommitResult(mode="committed", verify_passed=True, trashed=trashed,
                         intent_prov_id=intent["prov_id"])
+
+
+# ── F4 crash-recovery: reconcile orphaned commit_merge_intent records ───────────
+
+def find_orphan_commit_intents(prov: ProvenanceStore) -> list:
+    """``commit_merge_intent`` records with no matching ``commit_merge`` result and not yet reconciled —
+    the process died between the intent and the result (mid-trash). These are the orphans crash-recovery
+    must roll back."""
+    recs = prov.all_records()
+    done = {r.get("was_derived_from") for r in recs if r.get("activity") == "commit_merge"}
+    reconciled = {r.get("was_derived_from") for r in recs if r.get("activity") == "commit_merge_reconciled"}
+    return [r for r in recs if r.get("activity") == "commit_merge_intent"
+            and r.get("was_derived_from") not in done
+            and r.get("was_derived_from") not in reconciled]
+
+
+def reconcile_orphan_commits(prov: ProvenanceStore, reader: Any, gateway: Any, *,
+                             library_id: int, library_type: str = "user") -> list:
+    """F4 crash-recovery: roll back every orphaned commit_merge_intent. Reconstructs the snapshot from its
+    ``snapshot_cluster`` PROV before-image blob (ADR-008: snapshot_id IS the rollback index), re-reads the
+    live cluster, runs ``rollback_merge``, and records a ``commit_merge_reconciled`` PROV row. Returns the
+    per-orphan outcomes. Run at startup before resuming the merge chain."""
+    snap_blob = {r.get("was_derived_from"): (r.get("entity") or {}).get("before_blob")
+                 for r in prov.all_records() if r.get("activity") == "snapshot_cluster"}
+    outcomes: list = []
+    for orphan in find_orphan_commit_intents(prov):
+        sid = orphan.get("was_derived_from")
+        blob = snap_blob.get(sid)
+        if not blob:
+            outcomes.append({"snapshot_id": sid, "status": "no-snapshot-blob"})
+            continue
+        snapshot = cluster_snapshot_from_dict(prov.get_json_blob(blob))
+        observed = build_cluster(reader, snapshot.master_key, list(snapshot.secondary_keys))
+        rb = rollback_merge(snapshot, observed, gateway, library_id=library_id, library_type=library_type)
+        prov.record(activity="commit_merge_reconciled", item_key=snapshot.master_key, snapshot_id=sid,
+                    agent="merge-engine", tool_version=__version__,
+                    params={"rollback_ok": rb.ok, "failures": rb.failures})
+        outcomes.append({"snapshot_id": sid, "status": "reconciled" if rb.ok else "rollback_failed",
+                         "rollback": rb})
+    return outcomes

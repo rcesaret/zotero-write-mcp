@@ -318,3 +318,49 @@ def test_r3_rollback_failure_escalates(tmp_path, monkeypatch):
     res = commit_merge(snap, lib, lib, _fresh_prov(tmp_path), library_id=11056739, now=NOW)
     assert res.mode == "rollback_failed"               # not an uncaught exception, not a clean rollback
     assert res.rollback is not None and res.rollback.ok is False and res.rollback.failures
+
+
+# ── MC-3: smart_fill intent is recorded; F4: per-secondary trash PROV + crash reconcile ───
+
+def test_mc3_smart_fill_recorded_in_intent(tmp_path, monkeypatch):
+    monkeypatch.setenv(ENABLE_ENV, ENABLE_TOKEN)
+    raw = make_raw()
+    raw["M1"]["data"]["abstractNote"] = ""                       # master field empty at snapshot
+    raw["M2"]["data"]["abstractNote"] = "from the duplicate"
+    lib = FakeLibrary(raw)
+    snap = snapshot_cluster(lib, "M1", ["M2"], prov=ProvenanceStore(tmp_path / "s"))
+    merge_cluster(snap, lib, lib, library_id=11056739, smart_fill=True)
+    prov = _fresh_prov(tmp_path)
+    res = commit_merge(snap, lib, lib, prov, library_id=11056739, now=NOW, smart_fill=True)
+    assert res.mode == "committed"
+    intent = next(r for r in prov.all_records() if r["activity"] == "commit_merge_intent")
+    assert intent["params"]["smart_filled_fields"].get("abstractNote") == "from the duplicate"
+
+
+def test_f4_per_secondary_trash_prov(tmp_path, monkeypatch):
+    monkeypatch.setenv(ENABLE_ENV, ENABLE_TOKEN)
+    lib = FakeLibrary(make_raw())
+    snap = _snap_and_merge(lib, tmp_path)
+    prov = _fresh_prov(tmp_path)
+    commit_merge(snap, lib, lib, prov, library_id=11056739, now=NOW)
+    trashed = [r for r in prov.all_records() if r["activity"] == "commit_merge_trashed"]
+    assert {r["entity"]["item_key"] for r in trashed} == {"M2"}   # durable per-secondary record
+
+
+def test_f4_reconcile_orphan_rolls_back(tmp_path, monkeypatch):
+    """F4 crash-recovery: an orphaned commit_merge_intent (no result) is rolled back from its snapshot."""
+    from zotero_write_mcp.merge_live import reconcile_orphan_commits, find_orphan_commit_intents
+    monkeypatch.setenv(ENABLE_ENV, ENABLE_TOKEN)
+    lib = FakeLibrary(make_raw())
+    prov = ProvenanceStore(tmp_path / "prov")
+    snap = snapshot_cluster(lib, "M1", ["M2"], prov=prov)        # snapshot blob lives in `prov`
+    merge_cluster(snap, lib, lib, library_id=11056739)
+    # simulate a CRASH mid-commit: trash M2 + write the intent, but NO result record
+    lib.update_item(11056739, "M2", {"deleted": 1}, lib.items["M2"]["version"])
+    prov.record(activity="commit_merge_intent", item_key="M1", snapshot_id=snap.snapshot_id,
+                params={"secondaries": ["M2"]})
+    assert find_orphan_commit_intents(prov)                       # orphan detected
+    outcomes = reconcile_orphan_commits(prov, lib, lib, library_id=11056739)
+    assert outcomes and outcomes[0]["status"] == "reconciled"
+    assert lib.items["M2"]["data"].get("deleted") in (None, 0)    # M2 un-trashed by the reconcile rollback
+    assert not find_orphan_commit_intents(prov)                   # resolved (commit_merge_reconciled recorded)

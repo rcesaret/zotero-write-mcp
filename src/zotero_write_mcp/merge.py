@@ -96,6 +96,24 @@ class ClusterSnapshot:
         return asdict(self)
 
 
+def cluster_snapshot_from_dict(d: dict) -> "ClusterSnapshot":
+    """Rebuild a :class:`ClusterSnapshot` from its ``to_json()`` form — i.e. the snapshot_cluster PROV
+    before-image blob. Used by crash-recovery reconcile to roll back an orphaned commit from its snapshot
+    (ADR-008: ``snapshot_id`` is the rollback index)."""
+    def _att(a: dict) -> AttachmentSnap:
+        a = dict(a)
+        anns = [AnnotationSnap(**x) for x in (a.pop("annotations", []) or [])]
+        return AttachmentSnap(annotations=anns, **a)
+    return ClusterSnapshot(
+        snapshot_id=d["snapshot_id"],
+        master_key=d["master_key"],
+        secondary_keys=list(d["secondary_keys"]),
+        items={k: ItemSnap(**v) for k, v in d["items"].items()},
+        notes=[NoteSnap(**n) for n in (d.get("notes") or [])],
+        attachments=[_att(a) for a in (d.get("attachments") or [])],
+    )
+
+
 # ── Reader abstraction (injectable; live reader wraps read API + BBT JSON-RPC) ──
 
 class ClusterReader(Protocol):
