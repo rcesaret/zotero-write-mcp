@@ -241,6 +241,14 @@ def _is_empty(v: Any) -> bool:
     return v is None or v == "" or v == [] or v == {}
 
 
+def _rel_target_key(uri: Any) -> str:
+    """Extract the trailing Zotero item key from a relation URI (``.../items/<KEY>``). Base- and
+    library-agnostic, and uses EXACT key equality downstream — so secondary keys that are substrings
+    of one another (``ABCD`` vs ``ABCD1``) or of an unrelated relation URI cannot false-positive.
+    (Stage-E review MAJOR / red-team HOLE #2: the old ``k in v`` substring match was unsound.)"""
+    return str(uri).rstrip("/").rsplit("/", 1)[-1]
+
+
 def verify_merge(
     snapshot: ClusterSnapshot,
     observed: ClusterSnapshot,
@@ -274,15 +282,19 @@ def verify_merge(
         obs_m.item_type == sm.item_type and not bad_types,
         f"master {obs_m.item_type} vs snapshot {sm.item_type}; mismatched secondaries={bad_types}")
 
-    # 2 — version-drift: secondaries UNTOUCHED between snapshot and pre-DELETE verify. The master
-    #     legitimately advances (it was PATCHed); its concurrency is enforced at PATCH-time via
-    #     If-Unmodified-Since-Version, so it is excluded here.
+    # 2 — version-drift: secondaries UNTOUCHED between snapshot and pre-DELETE verify (a changed
+    #     secondary version signals a concurrent external edit -> fail-closed). The master is excluded:
+    #     it legitimately advances when PATCHed. NOTE (H-1 residual): in Phase-1 shadow there is no live
+    #     PATCH, so master freshness is NOT enforced by this gate; a concurrent edit to the master in the
+    #     merge window is closed at Phase-2 PATCH time via If-Unmodified-Since-Version, not here.
     drift = [k for k in sec_keys
              if observed.items.get(k) is None or observed.items[k].version != snapshot.items[k].version]
     add(2, "version-drift", not drift, f"secondaries with version drift={drift}")
 
-    # 3 — master scalar-field preservation: every non-empty snapshot scalar byte-identical;
-    #     smart_fill may only fill snapshot-EMPTY fields (those are not iterated here).
+    # 3 — master scalar-field preservation: every non-empty snapshot scalar (incl. creators) byte-
+    #     identical; smart_fill may only fill snapshot-EMPTY fields (those are not iterated here, so the
+    #     smart_fill flag needs no special handling in this gate — it is accepted for call-site symmetry).
+    #     A field deleted in observed (present non-empty in snapshot) is caught: obs.get(k) -> None != v.
     changed = []
     for k, v in sm.fields.items():
         if _is_empty(v):
@@ -304,8 +316,16 @@ def verify_merge(
     for it in cluster_items:
         expected_tags |= {tuple(t) for t in it.tags}
     obs_tags = {tuple(t) for t in obs_m.tags}
-    add(5, "tags-tuple-superset", expected_tags <= obs_tags,
-        f"missing tag tuples={sorted(expected_tags - obs_tags)}")
+    lost_tags = expected_tags - obs_tags                      # any snapshot (tag,type) dropped
+    expected_types: dict = {}
+    for (t, ty) in expected_tags:
+        expected_types.setdefault(t, set()).add(ty)
+    # a (tag, type) whose tag is known but whose type was in NO source = a type flip (incl. the
+    # additive flip that keeps the original tuple; red-team HOLE #1).
+    flipped_tags = [(t, ty) for (t, ty) in obs_tags
+                    if t in expected_types and ty not in expected_types[t]]
+    add(5, "tags-tuple-superset", not lost_tags and not flipped_tags,
+        f"lost={sorted(lost_tags)}; type-flips={sorted(flipped_tags)}")
 
     # 6 — relations superset (full dict) incl. dc:replaces → each secondary
     expected_rel: dict = {}
@@ -316,8 +336,8 @@ def verify_merge(
     for pred, vals in expected_rel.items():
         if not vals <= set(_as_list(obs_m.relations.get(pred))):
             rel_missing.append(pred)
-    dc_vals = [str(x) for x in _as_list(obs_m.relations.get("dc:replaces"))]
-    dc_missing = [k for k in sec_keys if not any(k in v for v in dc_vals)]
+    dc_target_keys = {_rel_target_key(x) for x in _as_list(obs_m.relations.get("dc:replaces"))}
+    dc_missing = [k for k in sec_keys if k not in dc_target_keys]   # EXACT key membership, not substring
     add(6, "relations-superset", not rel_missing and not dc_missing,
         f"missing predicates={rel_missing}; dc:replaces missing secondaries={dc_missing}")
 
@@ -440,6 +460,10 @@ def _zotero_tags(tags: list) -> list:
 
 
 def _is_trashed(item: ItemSnap) -> bool:
+    """True if the observed item carries a truthy Zotero ``deleted`` flag. READER CONTRACT: a
+    trashed-but-present secondary MUST appear in ``observed.items`` with ``deleted`` truthy so rollback
+    chooses un-trash (recoverable) over recreate (lossy); a reader that omits trashed items entirely
+    would mis-route state (c) to the recreate branch."""
     return item.json.get("deleted") in (1, "1", True)
 
 
@@ -498,6 +522,10 @@ def rollback_merge(
                             library_type=library_type)
         ops.append({"op": "untrash", "key": k})
     for k in absent:
+        # PHASE-2-INCOMPLETE: re-creating a hard-gone secondary needs version:0 (and is valid only if the
+        # item was PURGED, not trashed). Under "trash, never purge" a secondary is trashed (deleted:1) and
+        # takes the un-trash path above; this absent->recreate branch is a defensive stub that must zero
+        # version / strip server-managed keys per the Web API contract before live rollback (Phase 2).
         gateway.create_items(library_id, [snapshot.items[k].json], library_type=library_type)
         ops.append({"op": "recreate", "key": k})
 

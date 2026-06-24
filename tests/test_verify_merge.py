@@ -183,6 +183,32 @@ def test_master_absent_fails_closed(snap):
     assert not r.passed
 
 
+def test_6_dc_replaces_real_library_base(snap):
+    """#6 is base/library-agnostic: dc:replaces URIs with the REAL library id resolve by exact key."""
+    proj = copy.deepcopy(compute_merge_projection(snap))
+    proj.items["M1"].relations["dc:replaces"] = ["http://zotero.org/users/11056739/items/M2"]
+    rep = verify_merge(snap, proj)
+    assert rep.passed, rep.to_dict()
+
+
+def test_6_dc_replaces_substring_collision_caught(tmp_path):
+    """#6 must NOT false-positive when a secondary key is a substring of another item's URI
+    (S1 ⊂ S1X) — the Stage-E MAJOR / red-team HOLE #2 regression."""
+    items = {
+        "M1": _item("M1", 1, collections=[], tags=[], relations={}),
+        "S1": _item("S1", 2, collections=[], tags=[], relations={}),
+        "S1X": _item("S1X", 3, collections=[], tags=[], relations={}),
+    }
+    reader = FakeReader(items, {"M1": [], "S1": [], "S1X": []}, {},
+                        {"M1": "c", "S1": "c1", "S1X": "c2"})
+    snap = snapshot_cluster(reader, "M1", ["S1", "S1X"], prov=ProvenanceStore(tmp_path))
+    proj = copy.deepcopy(compute_merge_projection(snap))
+    # drop S1 from dc:replaces, keep S1X. Substring 'S1' in '.../items/S1X' must NOT mask the gap.
+    proj.items["M1"].relations["dc:replaces"] = ["http://zotero.org/users/0/items/S1X"]
+    rep = verify_merge(snap, proj)
+    assert not rep.passed and "relations-superset" in failed(rep)
+
+
 def test_smart_fill_allows_empty_field_fill(tmp_path):
     """smart_fill may fill a snapshot-EMPTY master field from a secondary; #3 still passes."""
     items = {
