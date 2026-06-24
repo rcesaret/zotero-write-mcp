@@ -417,3 +417,101 @@ def compute_merge_projection(
         snapshot_id=f"{snapshot.snapshot_id}-proj", master_key=m,
         secondary_keys=list(snapshot.secondary_keys), items=items, notes=notes, attachments=atts,
     )
+
+
+# ── rollback_merge — undo any of 3 partial states (TC-5; Stage-E C-2) ───────────
+
+@dataclass
+class RestoreReport:
+    """Outcome of a rollback. ``state`` ∈ {"a","b","c"}; ``operations`` is the executed restore plan."""
+    state: str
+    operations: list                  # [{op, key, ...}]
+    ok: bool = True
+
+
+class RollbackGateway(Protocol):
+    """The subset of WriteGateway rollback needs (injectable; tests record calls)."""
+    def update_item(self, library_id, item_key, data, version, *, library_type=...): ...
+    def create_items(self, library_id, objects, *, library_type=...): ...
+
+
+def _zotero_tags(tags: list) -> list:
+    return [{"tag": t, "type": ty} for (t, ty) in (tuple(x) for x in tags)]
+
+
+def _is_trashed(item: ItemSnap) -> bool:
+    return item.json.get("deleted") in (1, "1", True)
+
+
+def _master_differs(sm: ItemSnap, om: ItemSnap) -> bool:
+    return (set(sm.collections) != set(om.collections)
+            or {tuple(t) for t in sm.tags} != {tuple(t) for t in om.tags}
+            or sm.relations != om.relations
+            or sm.fields != om.fields)
+
+
+def rollback_merge(
+    snapshot: ClusterSnapshot,
+    observed: ClusterSnapshot,
+    gateway: RollbackGateway,
+    *,
+    library_id: int,
+    library_type: str = "user",
+) -> RestoreReport:
+    """Undo a merge from the snapshot, handling all 3 partial states (Stage-E C-2):
+
+    * **(a) nothing written** → no-op.
+    * **(b) PATCHed-not-deleted** → revert master collections/tags/relations/fields to snapshot AND
+      re-parent children to their original parents.
+    * **(c) partial DELETE** → restore the trashed/absent secondaries (un-trash via ``deleted:0``, or
+      recreate from the snapshot if hard-gone), THEN apply (b). Never relies on un-trash alone.
+
+    Versions for each PATCH come from the OBSERVED (current) state. Pure orchestration over the
+    injected gateway — deterministic and unit-testable with a fake gateway.
+    """
+    m = snapshot.master_key
+    sm = snapshot.items[m]
+    obs_m = observed.items.get(m)
+    ops: list = []
+
+    trashed, absent = [], []
+    for k in snapshot.secondary_keys:
+        oi = observed.items.get(k)
+        if oi is None:
+            absent.append(k)
+        elif _is_trashed(oi):
+            trashed.append(k)
+
+    master_changed = (obs_m is None) or _master_differs(sm, obs_m)
+    obs_children = {c.key: c for c in (observed.notes + observed.attachments)}
+    reparented = [c for c in (snapshot.notes + snapshot.attachments)
+                  if c.key in obs_children and obs_children[c.key].parent_key != c.parent_key]
+
+    if not trashed and not absent and not master_changed and not reparented:
+        return RestoreReport(state="a", operations=[], ok=True)
+
+    state = "c" if (trashed or absent) else "b"
+
+    # (c) restore secondaries FIRST (so children have a parent to return to)
+    for k in trashed:
+        gateway.update_item(library_id, k, {"deleted": 0}, observed.items[k].version,
+                            library_type=library_type)
+        ops.append({"op": "untrash", "key": k})
+    for k in absent:
+        gateway.create_items(library_id, [snapshot.items[k].json], library_type=library_type)
+        ops.append({"op": "recreate", "key": k})
+
+    # (b) revert master scalar/array fields, then re-parent children to their original parents
+    if obs_m is not None and master_changed:
+        revert = {**sm.fields, "collections": sm.collections,
+                  "tags": _zotero_tags(sm.tags), "relations": sm.relations}
+        gateway.update_item(library_id, m, revert, obs_m.version, library_type=library_type)
+        ops.append({"op": "revert-master", "key": m})
+
+    for c in reparented:
+        oc = obs_children[c.key]
+        gateway.update_item(library_id, c.key, {"parentItem": c.parent_key}, oc.version,
+                            library_type=library_type)
+        ops.append({"op": "reparent", "key": c.key, "to": c.parent_key})
+
+    return RestoreReport(state=state, operations=ops, ok=True)
