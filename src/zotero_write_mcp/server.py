@@ -15,6 +15,17 @@ from zotero_write_mcp.utils import (
     format_item_detail,
     title_similarity,
 )
+# Phase-2 merge transaction engine (the gated tools wired below; aliased to avoid colliding with the
+# @mcp.tool() function names).
+from zotero_write_mcp.merge import (
+    snapshot_cluster as _eng_snapshot, build_cluster as _eng_build, rollback_merge as _eng_rollback,
+)
+from zotero_write_mcp.merge_live import (
+    merge_cluster as _eng_merge, commit_merge as _eng_commit, load_snapshot as _eng_load_snapshot,
+    WebClusterReader,
+)
+from zotero_write_mcp.dedup import dedup_scan as _eng_dedup
+from zotero_write_mcp.observability import query_provenance as _eng_query_prov, daily_report as _eng_daily
 
 mcp = FastMCP(
     "ZoteroWrite",
@@ -640,7 +651,8 @@ def compare_items_for_merge(
         lines.append(f"\n**{diff_count} field(s) differ.**")
 
     lines.append(
-        "\nTo merge, use `merge_items` with the primary key and field overrides."
+        "\nTo merge, use the gated chain: snapshot_cluster -> merge_cluster -> commit_merge "
+        "(rollback_merge on failure). The legacy merge_items is retired."
     )
     return "\n".join(lines)
 
@@ -672,6 +684,20 @@ def merge_items(
         merge_tags: If True, combine tags from both items (default True)
         confirm: Must be True to execute. False returns a preview.
     """
+    # RETIRED (review OBS-6): merge_items performed an UNGATED destructive merge (update primary + PURGE-
+    # delete secondary) with no verify gate, bypassing the Phase-2 safety chain. It now refuses + redirects
+    # to the gated transaction. (Also blocked by the merge-safety enforcer hook; the code below is dead.)
+    return (
+        "merge_items is RETIRED — it bypassed the Phase-2 verify / enable-token / observability gate and "
+        "PURGE-deleted the secondary. Use the gated transaction instead:\n"
+        "  1) snapshot_cluster(master_key, dup_keys) -> snapshot_id\n"
+        "  2) merge_cluster(master_key, dup_keys, snapshot_id)\n"
+        "  3) commit_merge(master_key, snapshot_id)  -> verify-gated TRASH (not purge); SHADOW unless the "
+        "out-of-band ZOT_MERGE_LIVE_ENABLED env token is set AND observability is fresh\n"
+        "  rollback_merge(snapshot_id) on failure.\n"
+        "See memory/phase2-build-spec.md / .claude/rules/merge-safety.md."
+    )
+
     zot = get_client()
 
     # Safety check
@@ -755,6 +781,96 @@ def merge_items(
             f"secondary {secondary_key}: {e}\n"
             f"You may need to delete it manually."
         )
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  PHASE-2 MERGE TRANSACTION ENGINE (gated; the ONLY sanctioned merge path)
+# ═══════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def snapshot_cluster(master_key: str, dup_keys: list) -> str:
+    """Capture an immutable before-image of a duplicate cluster (master + dups). Returns a `snapshot_id`
+    that merge_cluster / commit_merge / rollback_merge consume — the snapshot IS the rollback index."""
+    zot = get_client()
+    reader = WebClusterReader(zot, zot.library_id)
+    snap = _eng_snapshot(reader, master_key, list(dup_keys), prov=zot.prov)
+    return json.dumps({"snapshot_id": snap.snapshot_id, "master_key": master_key,
+                       "secondaries": list(dup_keys), "n_notes": len(snap.notes),
+                       "n_attachments": len(snap.attachments)})
+
+
+@mcp.tool()
+def merge_cluster(master_key: str, dup_keys: list, snapshot_id: str, smart_fill: bool = False) -> str:
+    """PATCH phase of a merge: reparent children to the master + union collections/tags/relations +
+    dc:replaces. NO delete — reversible via rollback_merge. Aborts with NO writes on version drift."""
+    zot = get_client()
+    snap = _eng_load_snapshot(zot.prov, snapshot_id)
+    if snap is None:
+        return json.dumps({"error": f"unknown snapshot_id {snapshot_id}; call snapshot_cluster first"})
+    reader = WebClusterReader(zot, zot.library_id)
+    plan = _eng_merge(snap, reader, zot.gateway, library_id=zot.library_id, smart_fill=smart_fill)
+    return json.dumps({"drifted": plan.drifted, "drift_keys": plan.drift_keys,
+                       "patches": plan.patches, "master_version": plan.master_version})
+
+
+@mcp.tool()
+def commit_merge(master_key: str, snapshot_id: str, smart_fill: bool = False) -> str:
+    """Verify-gated commit: re-run the 11-check verify against the live post-PATCH state, then TRASH the
+    secondaries (PATCH deleted:1, NEVER purge). SHADOW by default — it only trashes when the out-of-band
+    env token ZOT_MERGE_LIVE_ENABLED is set AND observability is fresh AND the ceiling/disjointness gates
+    hold. Any post-verify failure routes to rollback_merge."""
+    zot = get_client()
+    snap = _eng_load_snapshot(zot.prov, snapshot_id)
+    if snap is None:
+        return json.dumps({"error": f"unknown snapshot_id {snapshot_id}"})
+    reader = WebClusterReader(zot, zot.library_id)
+    res = _eng_commit(snap, reader, zot.gateway, zot.prov, library_id=zot.library_id, smart_fill=smart_fill)
+    return json.dumps({"mode": res.mode, "reason": res.reason, "verify_passed": res.verify_passed,
+                       "trashed": res.trashed,
+                       "rollback_ok": (res.rollback.ok if res.rollback else None)})
+
+
+@mcp.tool()
+def rollback_merge(snapshot_id: str) -> str:
+    """Undo a merge from its snapshot: un-trash secondaries + revert the master + reparent children to
+    their original parents. `ok` is False if a restore op itself failed (escalate to human recovery)."""
+    zot = get_client()
+    snap = _eng_load_snapshot(zot.prov, snapshot_id)
+    if snap is None:
+        return json.dumps({"error": f"unknown snapshot_id {snapshot_id}"})
+    reader = WebClusterReader(zot, zot.library_id)
+    observed = _eng_build(reader, snap.master_key, list(snap.secondary_keys))
+    rb = _eng_rollback(snap, observed, zot.gateway, library_id=zot.library_id)
+    return json.dumps({"state": rb.state, "ok": rb.ok, "operations": rb.operations, "failures": rb.failures})
+
+
+@mcp.tool()
+def dedup_scan(item_keys: list, review_threshold: float = 0.99) -> str:
+    """Deterministic duplicate clustering over the given items. `auto_accept` fires ONLY on the ASySD
+    boolean (exact DOI OR exact normalized title+year+first-author) with item-type/title/DOI conflict
+    guards; probabilistic scoring is a deferred review-queue-only seam. Never commits."""
+    zot = get_client()
+    items = [zot.get_item_web(k) for k in item_keys]
+    res = _eng_dedup(items, review_threshold=review_threshold)
+    clusters = [{"item_keys": c.item_keys, "auto_accept": c.auto_accept, "master_key": c.master_key,
+                 "reason": c.reason, "conflicts": c.conflicts} for c in res["candidate_clusters"]]
+    return json.dumps({"candidate_clusters": clusters, "auto_accept_count": res["auto_accept_count"],
+                       "review_count": res["review_count"], "probabilistic_review": res["probabilistic_review"]})
+
+
+@mcp.tool()
+def query_provenance(item_key: str) -> str:
+    """The full PROV history for an item — every mutation with its before/after sha256 + the per-record
+    reversibility index (snapshot_id / reverse / blobs)."""
+    return json.dumps(_eng_query_prov(get_client().prov, item_key), default=str)
+
+
+@mcp.tool()
+def merge_health_report() -> str:
+    """Compute + record the daily merge-health marker (verify-pass-rate, merges-committed, sampled audit).
+    The marker gates live commits — commit_merge refuses on a stale or below-floor (degraded) report."""
+    return json.dumps(_eng_daily(get_client().prov), default=str)
 
 
 @mcp.tool()

@@ -423,3 +423,39 @@ def reconcile_orphan_commits(prov: ProvenanceStore, reader: Any, gateway: Any, *
         outcomes.append({"snapshot_id": sid, "status": "reconciled" if rb.ok else "rollback_failed",
                          "rollback": rb})
     return outcomes
+
+
+# ── live reader + snapshot loader (for the MCP tool layer) ──────────────────────
+
+class WebClusterReader:
+    """Live :class:`~zotero_write_mcp.merge.ClusterReader` over a ZoteroClient — version-accurate web GETs;
+    ``get_children`` includes TRASHED children (``?includeTrashed=1``) so M-4 / the terminal verify can see
+    a cascade-trashed child."""
+
+    def __init__(self, client: Any, library_id: int):
+        self._c = client
+        self._lib = library_id
+
+    def get_item(self, key: str) -> dict:
+        return self._c._web_get(f"/users/{self._lib}/items/{key}")
+
+    def get_children(self, key: str) -> list:
+        return self._c._web_get(f"/users/{self._lib}/items/{key}/children", {"includeTrashed": 1})
+
+    def get_annotations(self, attachment_key: str) -> list:
+        return [c for c in self.get_children(attachment_key)
+                if c.get("data", {}).get("itemType") == "annotation"]
+
+    def get_citekey(self, key: str) -> Optional[str]:
+        return None   # BBT JSON-RPC citekey lookup — TODO; None is safe for check #11 (preserve-unchanged)
+
+
+def load_snapshot(prov: ProvenanceStore, snapshot_id: str) -> Optional[ClusterSnapshot]:
+    """Reconstruct a :class:`ClusterSnapshot` from its ``snapshot_cluster`` PROV before-image blob — the
+    bridge the merge_cluster/commit_merge/rollback_merge MCP tools use to load a snapshot by id."""
+    for r in prov.all_records():
+        if r.get("activity") == "snapshot_cluster" and r.get("was_derived_from") == snapshot_id:
+            blob = (r.get("entity") or {}).get("before_blob")
+            if blob:
+                return cluster_snapshot_from_dict(prov.get_json_blob(blob))
+    return None
