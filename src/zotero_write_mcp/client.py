@@ -1,10 +1,20 @@
-"""Zotero hybrid API client: local reads, web API writes."""
+"""Zotero hybrid API client: local reads, web API writes.
+
+All mutations route through the write gateway v2 (the single mutation chokepoint) and every mutation
+is recorded to the provenance store before the method returns (Phase 0: P0-legacy-retire). Reads stay
+on the local API.
+"""
 import hashlib
 import json
 import os
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
+
+from zotero_write_mcp import __version__
+from zotero_write_mcp.gateway import HttpxTransport, WriteGateway
+from zotero_write_mcp.provenance import ProvenanceStore
 
 
 class ZoteroClient:
@@ -15,7 +25,8 @@ class ZoteroClient:
     requires an API key with write permissions.
     """
 
-    def __init__(self):
+    def __init__(self, *, gateway: Optional[WriteGateway] = None,
+                 prov: Optional[ProvenanceStore] = None):
         # ── Local API (reads) ──────────────────────────────────────
         self.local_url = os.environ.get(
             "ZOTERO_LOCAL_URL", "http://127.0.0.1:23119/api"
@@ -37,6 +48,12 @@ class ZoteroClient:
 
         self._library_id: Optional[int] = None
         self._client = httpx.Client(timeout=30.0)
+
+        # ── Write gateway v2 + provenance (the SINGLE mutation path) ──
+        # All writes route through the gateway and are logged to PROV before returning. Both are
+        # lazy and injectable (tests inject a fake transport + a temp PROV store).
+        self._gateway = gateway
+        self._prov = prov
 
     # ── Backward compat ───────────────────────────────────────────
     @property
@@ -60,6 +77,35 @@ class ZoteroClient:
     @property
     def lib_prefix(self) -> str:
         return f"{self.local_url}/users/{self.library_id}"
+
+    # ── Write gateway v2 + provenance ─────────────────────────────
+    @property
+    def gateway(self) -> WriteGateway:
+        """The single mutation chokepoint (lazy). Built over the web httpx client + auth headers."""
+        if self._gateway is None:
+            self._gateway = WriteGateway(
+                HttpxTransport(self._client, self.web_url, self._web_headers))
+        return self._gateway
+
+    @property
+    def prov(self) -> ProvenanceStore:
+        """The provenance store (lazy). Root from $ZOTERO_PROV_DIR, else ~/.zotero-write-mcp/prov."""
+        if self._prov is None:
+            root = os.environ.get("ZOTERO_PROV_DIR") or str(
+                Path.home() / ".zotero-write-mcp" / "prov")
+            self._prov = ProvenanceStore(root)
+        return self._prov
+
+    @staticmethod
+    def _envelope_compat(result) -> dict:
+        """Reconstruct the legacy {success, successful, unchanged, failed} dict the tools consume."""
+        return {
+            "success": {str(i): k for i, k in enumerate(result.item_keys)},
+            "successful": result.successful,
+            "unchanged": result.unchanged,
+            "failed": result.failed,
+            "last_modified_version": result.last_modified_version,
+        }
 
     def _detect_library_id(self) -> int:
         """Auto-detect library ID from local Zotero instance."""
@@ -181,32 +227,36 @@ class ZoteroClient:
             return self._web_get("/items/new", params={"itemType": item_type})
 
     def create_items(self, items: list[dict]) -> dict:
-        """Create items via web API."""
-        return self._web_post(f"/users/{self.library_id}/items", items)
+        """Create items through the write gateway (versioned, chunked, structured); log PROV.
+
+        Returns the legacy ``{success, successful, unchanged, failed}`` envelope the create tools consume.
+        """
+        result = self.gateway.create_items_chunked(self.library_id, items)
+        for i, key in enumerate(result.item_keys):
+            after = items[i] if i < len(items) else None
+            self.prov.record(
+                activity="create_item", item_key=key, after=after,
+                agent="zotero-write", tool_version=__version__,
+                params={"itemType": (after or {}).get("itemType")})
+        return self._envelope_compat(result)
 
     def update_item(self, item_key: str, data: dict, version: int) -> Any:
-        """Update item via web API (PATCH for partial updates).
-        
-        Retries once on 412 Precondition Failed by re-reading current version.
-        """
-        try:
-            return self._web_patch(
-                f"/users/{self.library_id}/items/{item_key}", data, version
-            )
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 412:
-                # Version mismatch — re-read and retry
-                fresh = self.get_item_web(item_key)
-                fresh_version = fresh.get("version", fresh.get("data", {}).get("version"))
-                return self._web_patch(
-                    f"/users/{self.library_id}/items/{item_key}", data, fresh_version
-                )
-            raise
+        """Update item through the gateway (PATCH; rejects version-less; 412 re-GET + retry); log PROV."""
+        result = self.gateway.update_item(self.library_id, item_key, data, version)
+        self.prov.record(
+            activity="update_item", item_key=item_key, after=data,
+            agent="zotero-write", tool_version=__version__,
+            params={"fields": sorted(data.keys())})
+        return result
 
     def delete_item(self, item_key: str, version: int) -> bool:
-        return self._web_delete(
-            f"/users/{self.library_id}/items/{item_key}", version
-        )
+        """Delete (trash) an item through the gateway; log PROV. 412 -> ConcurrencyConflictError."""
+        self.gateway.delete_items(self.library_id, [item_key], version)
+        self.prov.record(
+            activity="delete_item", item_key=item_key,
+            agent="zotero-write", tool_version=__version__,
+            params={"version": version})
+        return True
 
     def get_all_items(self, limit: int = 100, start: int = 0,
                       item_type: str = "-attachment") -> list[dict]:
@@ -255,7 +305,13 @@ class ZoteroClient:
             "tags": [],
             "relations": {},
         }
-        return self._web_post(f"/users/{self.library_id}/items", [attachment_data])
+        result = self.gateway.create_items(self.library_id, [attachment_data])
+        if result.item_keys:
+            self.prov.record(
+                activity="attach_file_linked", item_key=parent_key,
+                agent="zotero-write", tool_version=__version__,
+                params={"attachment_key": result.item_keys[0], "linkMode": "linked_file"})
+        return self._envelope_compat(result)
 
     def create_imported_file_attachment(
         self, parent_key: str, file_path: str, title: str, content_type: str
@@ -286,12 +342,15 @@ class ZoteroClient:
             "tags": [],
             "relations": {},
         }
-        result = self._web_post(f"/users/{self.library_id}/items", [attachment_data])
-        success = result.get("success", {})
-        if not success:
-            return result
-
-        att_key = list(success.values())[0]
+        gw_result = self.gateway.create_items(self.library_id, [attachment_data])
+        if not gw_result.item_keys:
+            return self._envelope_compat(gw_result)
+        att_key = gw_result.item_keys[0]
+        success = {"0": att_key}
+        self.prov.record(
+            activity="attach_file_imported", item_key=parent_key,
+            agent="zotero-write", tool_version=__version__,
+            params={"attachment_key": att_key, "linkMode": "imported_file", "filename": filename})
 
         # Step 2: Request upload authorization
         auth_url = f"{self.web_url}/users/{self.library_id}/items/{att_key}/file"

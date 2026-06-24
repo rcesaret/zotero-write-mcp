@@ -27,6 +27,7 @@ params) -> resp``-like with ``.status_code``, ``.json()``, ``.headers``), plus i
 """
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -327,3 +328,25 @@ class WriteGateway:
                 merged.last_modified_version = res.last_modified_version
                 cur = res.last_modified_version
         return merged
+
+
+class HttpxTransport:
+    """Adapts an ``httpx.Client`` to the gateway transport contract.
+
+    Prepends the Web API base URL and merges the auth headers, and — crucially — does **not** call
+    ``raise_for_status``: the gateway inspects status codes itself (including 412), so 4xx/5xx must be
+    returned, not raised. Returns the raw ``httpx.Response`` (``.status_code`` / ``.json()`` / ``.headers``).
+    """
+
+    def __init__(self, http_client: Any, base_url: str, auth_headers: dict):
+        self._http = http_client
+        self._base = str(base_url).rstrip("/")
+        self._auth = dict(auth_headers)
+
+    def request(self, method: str, path: str, *, json: Any = None,
+                headers: Optional[dict] = None, params: Optional[dict] = None):
+        import json as _json
+        hdrs = {**self._auth, **(headers or {})}
+        content = _json.dumps(json) if json is not None else None
+        return self._http.request(
+            method, f"{self._base}{path}", headers=hdrs, params=params, content=content)
