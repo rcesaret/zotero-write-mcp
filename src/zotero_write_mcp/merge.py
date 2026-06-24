@@ -515,3 +515,48 @@ def rollback_merge(
         ops.append({"op": "reparent", "key": c.key, "to": c.parent_key})
 
     return RestoreReport(state=state, operations=ops, ok=True)
+
+
+# ── shadow_merge — compute + verify + log, NO commit (TC-3 shadow; ADR-004) ─────
+
+@dataclass
+class ShadowReport:
+    snapshot_id: str
+    passed: bool
+    integrity: IntegrityReport
+    projection: ClusterSnapshot
+
+
+def shadow_merge(
+    reader: ClusterReader,
+    master_key: str,
+    dup_keys: list,
+    *,
+    prov: ProvenanceStore,
+    smart_fill: bool = False,
+    observed: Optional[ClusterSnapshot] = None,
+    library_base: str = "http://zotero.org/users/0/items",
+) -> ShadowReport:
+    """Shadow mode: ``snapshot → compute projection → verify → LOG``. **No writes** — this function
+    takes no gateway and structurally cannot commit (ADR-004 shadow phase: the isolation mechanism that
+    replaces a test library, decision Q8).
+
+    By default verify runs against the computed projection (always self-consistent — this exercises the
+    pipeline + PROV observability). Pass ``observed`` (a re-read of the live post-merge state) to verify
+    real discrepancies — that is how Phase 2 wires shadow to the live ``merge_cluster`` output, and how
+    the live dc:replaces smoke verifies a real merge.
+    """
+    snap = snapshot_cluster(reader, master_key, dup_keys, prov=prov)
+    projection = compute_merge_projection(snap, smart_fill=smart_fill, library_base=library_base)
+    state = observed if observed is not None else projection
+    report = verify_merge(snap, state, smart_fill=smart_fill)
+    prov.record(
+        activity="shadow_merge", item_key=master_key, snapshot_id=snap.snapshot_id,
+        agent="merge-engine", tool_version=__version__,
+        params={"pass": report.passed, "n_checks": len(report.checks),
+                "failed": [c.name for c in report.failed],
+                "against": "observed" if observed is not None else "projection",
+                "secondary_keys": list(dup_keys), "smart_fill": smart_fill},
+    )
+    return ShadowReport(snapshot_id=snap.snapshot_id, passed=report.passed,
+                        integrity=report, projection=projection)
