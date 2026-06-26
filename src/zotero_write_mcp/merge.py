@@ -294,6 +294,47 @@ def _enriched_fields(snapshot: ClusterSnapshot, field_sources: Optional[dict]) -
     return out
 
 
+def _extra_add_tex_ids(extra_text: Optional[str], alias_keys: list) -> str:
+    """Add ``alias_keys`` to a ``tex.ids:`` line in the Zotero ``extra`` field — Better BibTeX's mechanism
+    for ALTERNATE citation keys, so citing a merged-away duplicate's key still resolves to the survivor.
+    Preserves every other ``extra`` line and de-dups against any pre-existing tex.ids keys (idempotent)."""
+    other: list = []
+    existing: list = []
+    for ln in (extra_text or "").splitlines():
+        if ln.strip().lower().startswith("tex.ids:"):
+            existing += [x.strip() for x in ln.split(":", 1)[1].split(",")]
+        else:
+            other.append(ln)
+    merged = [k for k in dict.fromkeys(existing + list(alias_keys)) if k]
+    if not merged:
+        return extra_text or ""
+    other = [ln for ln in other if ln.strip()]
+    return "\n".join(other + [f"tex.ids: {', '.join(merged)}"])
+
+
+def _alias_extra(snapshot: ClusterSnapshot, base_extra: Optional[str] = None) -> Optional[str]:
+    """The survivor's ``extra`` with the trashed duplicates' BBT citekeys accumulated as ``tex.ids`` aliases
+    (so a manuscript citing a duplicate's ``@citekey`` still resolves post-merge). None when no secondary
+    carries a ``citationKey`` — nothing to preserve."""
+    alias_keys = [k for k in (snapshot.items[s].fields.get("citationKey") for s in snapshot.secondary_keys) if k]
+    if not alias_keys:
+        return None
+    base = base_extra if base_extra is not None else snapshot.items[snapshot.master_key].fields.get("extra")
+    return _extra_add_tex_ids(base, alias_keys)
+
+
+def _master_overrides(snapshot: ClusterSnapshot, field_sources: Optional[dict]) -> dict:
+    """The full set of survivor scalar-field overrides a merge applies: the owner-approved field-level
+    enrichment (``_enriched_fields``) PLUS citekey-alias accumulation (the duplicates' BBT citekeys preserved
+    as ``tex.ids`` on the survivor's ``extra``). Projection, verify, AND the merge PATCH all derive the
+    overrides from this single function, so they agree and the gate enforces EXACTLY this result."""
+    out = _enriched_fields(snapshot, field_sources)
+    alias = _alias_extra(snapshot, out.get("extra"))
+    if alias is not None:
+        out["extra"] = alias
+    return out
+
+
 def verify_merge(
     snapshot: ClusterSnapshot,
     observed: ClusterSnapshot,
@@ -345,7 +386,7 @@ def verify_merge(
     #     field_sources this is pure survivor preservation; with them, a field NOT enriched to EXACTLY the
     #     approved value — or changed to anything else — is caught: obs.get(k) -> None/other != v.
     expected_fields = dict(sm.fields)
-    expected_fields.update(_enriched_fields(snapshot, field_sources))
+    expected_fields.update(_master_overrides(snapshot, field_sources))
     changed = []
     for k, v in expected_fields.items():
         if _is_empty(v):
@@ -467,7 +508,7 @@ def compute_merge_projection(
             for k, v in it.fields.items():
                 if _is_empty(fields.get(k)) and not _is_empty(v):
                     fields[k] = v
-    fields.update(_enriched_fields(snapshot, field_sources))   # Phase B: approved field-level enrichment wins
+    fields.update(_master_overrides(snapshot, field_sources))   # Phase B: enrichment + citekey-alias accumulation
 
     proj_master = ItemSnap(
         key=m, version=sm.version + 1, item_type=sm.item_type,

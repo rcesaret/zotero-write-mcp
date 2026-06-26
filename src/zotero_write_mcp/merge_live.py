@@ -21,7 +21,7 @@ from zotero_write_mcp import __version__
 from zotero_write_mcp.gateway import ConcurrencyConflictError, library_prefix
 from zotero_write_mcp.merge import (
     ClusterSnapshot, RestoreReport, build_cluster, cluster_snapshot_from_dict, compute_merge_projection,
-    rollback_merge, verify_merge, _as_list, _is_empty, _is_trashed, _unwrap, _zotero_tags,
+    rollback_merge, verify_merge, _as_list, _is_empty, _is_trashed, _master_overrides, _unwrap, _zotero_tags,
 )
 from zotero_write_mcp.observability import observability_is_fresh
 from zotero_write_mcp.provenance import ProvenanceStore
@@ -98,13 +98,13 @@ def merge_cluster(
         for k, v in pm.fields.items():
             if _is_empty(snap_fields.get(k)) and not _is_empty(v) and _is_empty(live.get(k)):
                 master_data[k] = v
-    # Phase B: apply the owner-approved field-level enrichment (each reconciled field <- its chosen source
-    # member's value, taken from the projection). The drift check above + retry_on_412=False guarantee the
-    # live master is unchanged since the snapshot, so overwriting its scalar fields never clobbers a
-    # concurrent edit; verify_merge check #3 (also given field_sources) confirms the result is EXACTLY this.
-    for fld in (field_sources or {}):
-        if fld in pm.fields:
-            master_data[fld] = pm.fields[fld]
+    # Phase B: apply the owner-approved field-level enrichment AND citekey-alias accumulation. The override
+    # set (enrichment values + the survivor's tex.ids extra) is computed identically by the projection and by
+    # verify check #3, so this PATCH produces EXACTLY what the gate expects. The drift check above +
+    # retry_on_412=False guarantee the live master is unchanged since the snapshot, so overwriting its scalar
+    # fields never clobbers a concurrent edit.
+    for fld, val in _master_overrides(snapshot, field_sources).items():
+        master_data[fld] = val
 
     # 3. Execute fail-closed (retry_on_412=False): a 412 = a concurrent edit landed AFTER the drift
     #    check -> abort (report the partial so the caller can rollback + re-snapshot), never blind-re-apply

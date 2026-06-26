@@ -8,7 +8,7 @@ import copy
 
 from zotero_write_mcp.merge import (
     snapshot_cluster, compute_merge_projection, verify_merge, _enriched_fields,
-    build_cluster, rollback_merge,
+    build_cluster, rollback_merge, _extra_add_tex_ids,
 )
 from zotero_write_mcp.provenance import ProvenanceStore
 
@@ -131,3 +131,46 @@ def test_rollback_clears_enrichment_added_field(tmp_path):
     revert = next(c["data"] for c in gw.calls if c["key"] == "M1" and "title" in c["data"])
     assert revert["title"] == "Basin of Mexico"      # CHANGED field reverted to the survivor's original
     assert revert["publisher"] == ""                 # ADDED field explicitly cleared
+
+
+# ── citekey-alias accumulation (BBT tex.ids) ────────────────────────────────────
+
+def _snap_ck(tmp_path, survivor_extra=None):
+    m1 = {"extra": survivor_extra} if survivor_extra is not None else {}
+    items = {
+        "M1": _item("M1", 100, title="Basin of Mexico", date="1979", collections=[], tags=[], relations={}, **m1),
+        "M2": _item("M2", 101, title="Basin of Mexico", date="1979", citationKey="dupKey1979",
+                    collections=[], tags=[], relations={}),
+    }
+    return snapshot_cluster(_Reader(items), "M1", ["M2"], prov=ProvenanceStore(tmp_path))
+
+
+def test_extra_add_tex_ids_basics():
+    assert _extra_add_tex_ids(None, ["a", "b"]) == "tex.ids: a, b"
+    assert _extra_add_tex_ids("Some note", ["a"]) == "Some note\ntex.ids: a"
+    assert _extra_add_tex_ids("tex.ids: a", ["a", "b"]) == "tex.ids: a, b"      # merge + dedup
+    assert _extra_add_tex_ids("foo\ntex.ids: x", ["x"]) == "foo\ntex.ids: x"    # idempotent
+
+
+def test_projection_accumulates_secondary_citekey_alias(tmp_path):
+    proj = compute_merge_projection(_snap_ck(tmp_path))
+    assert proj.items["M1"].fields["extra"] == "tex.ids: dupKey1979"
+
+
+def test_alias_preserves_survivor_extra(tmp_path):
+    proj = compute_merge_projection(_snap_ck(tmp_path, survivor_extra="DOI: 10.1/x"))
+    assert proj.items["M1"].fields["extra"] == "DOI: 10.1/x\ntex.ids: dupKey1979"
+
+
+def test_verify_accepts_alias_and_rejects_missing(tmp_path):
+    snap = _snap_ck(tmp_path)
+    proj = compute_merge_projection(snap)
+    assert verify_merge(snap, proj).passed                       # alias present -> ok
+    bad = copy.deepcopy(proj)
+    bad.items["M1"].fields["extra"] = ""                         # the alias was not written
+    assert "master-scalar-preservation" in _failed(verify_merge(snap, bad))
+
+
+def test_no_secondary_citekey_no_alias(tmp_path):
+    proj = compute_merge_projection(_snap(tmp_path))             # M2 has no citationKey
+    assert not proj.items["M1"].fields.get("extra")

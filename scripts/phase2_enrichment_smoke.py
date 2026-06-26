@@ -69,7 +69,7 @@ def main():
         env = client.create_items([
             {"itemType": "book", "title": SHORT, "tags": [{"tag": "DELETE-ME"}]},
             {"itemType": "book", "title": FULL, "publisher": "ZZZ Smoke Press", "place": "Smoketown",
-             "tags": [{"tag": "DELETE-ME"}]},
+             "citationKey": "zzsmokedup1979", "tags": [{"tag": "DELETE-ME"}]},
         ])
         if env.get("failed"):
             raise RuntimeError(f"create survivor/secondary failed: {env['failed']}")
@@ -89,6 +89,9 @@ def main():
 
         # 2 — snapshot, 3 — field_sources: take title + publisher + place from the SECONDARY
         snap = M.snapshot_cluster(reader, master, [secondary], prov=prov)
+        sec_ck = snap.items[secondary].fields.get("citationKey")
+        test_alias = bool(sec_ck)
+        print(f"[CITEKEY]  secondary citationKey via API = {sec_ck!r}  (alias test enabled: {test_alias})")
         fs = {"title": secondary, "publisher": secondary, "place": secondary}
         plan = merge_cluster(snap, reader, gw, library_id=LIBRARY_ID, field_sources=fs)
         if plan.drifted:
@@ -105,6 +108,11 @@ def main():
         print(f"[REPARENT] note.parent={nd.get('parentItem')} att.parent={ad.get('parentItem')}  -> {reparent_ok}")
         if not (enr_ok and reparent_ok):
             raise RuntimeError("enrichment or re-parent wrong after merge_cluster")
+        alias_ok = (not test_alias) or (f"tex.ids: {sec_ck}" in (md.get("extra") or ""))
+        print(f"[ALIAS]    survivor extra={md.get('extra')!r}  -> "
+              f"{'PASS' if (alias_ok and test_alias) else ('SKIPPED (no API citekey)' if not test_alias else 'FAIL')}")
+        if not alias_ok:
+            raise RuntimeError("citekey alias (tex.ids) not written to survivor extra")
 
         # 4 — fresh observability, 5 — verify-gated commit (the 11-check verify runs WITH field_sources)
         daily_report(prov, ts=now.isoformat())
@@ -132,7 +140,8 @@ def main():
         nd3 = reader.get_item(note)["data"]
         sd3 = reader.get_item(secondary)["data"]
         restored = (rb.ok and sd3.get("deleted") in (None, 0) and nd3.get("parentItem") == secondary
-                    and md3.get("title") == SHORT and not md3.get("publisher") and not md3.get("place"))
+                    and md3.get("title") == SHORT and not md3.get("publisher") and not md3.get("place")
+                    and (not test_alias or not md3.get("extra")))
         print(f"[ROLLBACK] ok={rb.ok} secondary un-trashed={sd3.get('deleted') in (None, 0)} "
               f"note re-parented back={nd3.get('parentItem') == secondary}")
         print(f"[REVERT]   survivor title -> '{md3.get('title')}' | publisher cleared={not md3.get('publisher')} "
