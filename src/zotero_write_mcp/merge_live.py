@@ -443,8 +443,16 @@ class WebClusterReader:
         return self._c._web_get(f"/users/{self._lib}/items/{key}/children", {"includeTrashed": 1})
 
     def get_annotations(self, attachment_key: str) -> list:
-        return [c for c in self.get_children(attachment_key)
-                if c.get("data", {}).get("itemType") == "annotation"]
+        # Zotero's /children endpoint returns 400 ("can only be called on PDF, EPUB, and snapshot
+        # attachments") for any other attachment type — those simply carry no annotations. Treat that as an
+        # empty annotation list rather than letting it abort the whole snapshot_cluster / verify chain.
+        try:
+            children = self.get_children(attachment_key)
+        except Exception as exc:
+            if getattr(getattr(exc, "response", None), "status_code", None) == 400:
+                return []
+            raise
+        return [c for c in children if c.get("data", {}).get("itemType") == "annotation"]
 
     def get_citekey(self, key: str) -> Optional[str]:
         return None   # BBT JSON-RPC citekey lookup — TODO; None is safe for check #11 (preserve-unchanged)
