@@ -77,6 +77,45 @@ def _min_title_jaccard(by_key: dict, keys: list) -> float:
     return worst
 
 
+def normalize_subtitle(title: Any) -> str:
+    """Normalized text AFTER the first colon — the part ``normalize_title`` DROPS. '' when there is no
+    colon. Distinct non-empty subtitles across a cluster signal distinct works (a volume / part / region /
+    section designation), not a duplicate — the failure mode the 2026-06 exit-gate audit surfaced (an entire
+    6-state census series was collapsing into one auto-accept cluster)."""
+    if not title:
+        return ""
+    parts = str(title).split(":", 1)
+    if len(parts) < 2:
+        return ""
+    return _WS.sub(" ", _PUNCT.sub(" ", _strip_diacritics(parts[1]).lower())).strip()
+
+
+# A differing volume/part/tome designation across cluster members => a multi-volume/part series, NOT a
+# duplicate. Requires a marker FOLLOWED BY a number/ordinal so a bare word ("part of the study") never trips.
+_VOL_RE = re.compile(
+    r"\b(volume|vol|tomo|tome|part|parte|band|fascicle|fasc|heft|libro|livre)\s+"
+    r"(\d{1,3}|i|ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii|xiii|xiv|xv|"
+    r"primer[oa]|segund[oa]|tercer[oa]|cuart[oa]|quint[oa]|first|second|third|fourth|fifth)\b"
+)
+
+
+def _volume_signature(title_norm: str) -> frozenset:
+    """Set of '<marker> <number>' volume designations in a FULL-normalized title (e.g. {'tomo ii'}). A
+    differing signature across members (incl. present-vs-absent) marks distinct volumes -> demote."""
+    return frozenset(f"{m.group(1)} {m.group(2)}" for m in _VOL_RE.finditer(title_norm))
+
+
+def _creator_surnames(item: Any) -> frozenset:
+    """Normalized surname set over ALL creators (authors + editors) — used only for the weak (empty
+    first-author) ASySD key, where distinct works can otherwise wear the same (title, year, '') mask."""
+    out = set()
+    for c in _data(item).get("creators", []) or []:
+        ln = c.get("lastName") or c.get("name") or ""
+        if ln:
+            out.add(_WS.sub(" ", _strip_diacritics(str(ln)).lower()).strip())
+    return frozenset(out)
+
+
 def normalize_year(item: Any) -> str:
     d = _data(item)
     for fld in ("date", "year", "issued"):
@@ -224,4 +263,20 @@ def _conflicts(by_key: dict, keys: list, *, path: str) -> list:
         dois.discard(None)
         if len(dois) > 1:
             out.append("DOI disagreement")
+        # 2026-06 exit-gate audit: the subtitle ``normalize_title`` drops, or a volume designation,
+        # distinguishes distinct works (multi-volume / multi-part / by-region / by-section) that share the
+        # subtitle-stripped key. A DESCRIPTIVE subtitle merely ADDED to one side (bare main title on the
+        # other, no second subtitle, no volume marker) is left auto-acceptable (B2 true-duplicate case).
+        subs = {normalize_subtitle(_data(by_key[k]).get("title")) for k in keys}
+        subs.discard("")
+        if len(subs) > 1:
+            out.append("subtitle disagreement")
+        if len({_volume_signature(normalize_title_full(_data(by_key[k]).get("title"))) for k in keys}) > 1:
+            out.append("volume/part disagreement")
+        # weak key: the ASySD key matched on an EMPTY first-author (editor-only / anonymous). Require the
+        # full creator surname SETS to agree, else distinct chapters wear the same (title, year, '') mask.
+        # (Same-set-different-order editors stay auto-acceptable — a genuine author-order duplicate.)
+        if not all(first_author_surname(by_key[k]) for k in keys) \
+                and len({_creator_surnames(by_key[k]) for k in keys}) > 1:
+            out.append("creator disagreement (weak key)")
     return out

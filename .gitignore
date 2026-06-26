@@ -29,3 +29,6 @@ Desktop.ini
 .env
 *.key
 *.pem
+
+# Phase-2 exit-gate run artifacts (audit reports + isolated PROV stores)
+exit-gate-runs/

@@ -166,3 +166,75 @@ def test_probabilistic_seam_disabled():
     res = dedup_scan([], review_threshold=0.95)
     assert res["probabilistic_review"]["enabled"] is False
     assert res["probabilistic_review"]["review_threshold"] == 0.95
+
+
+# ── 2026-06 exit-gate audit hardening: multi-volume / part / region + weak-key guards ──
+# Regression set mirroring the 19 false positives + 4 uncertains the live-library exit-gate audit found.
+
+def _ed(*surnames):
+    return [{"creatorType": "editor", "lastName": s} for s in surnames]
+
+
+def test_multi_volume_subtitle_demotes():
+    """Audit FP [56]: same main-title key + author + year, but subtitles differ by volume (Tomo I vs II)."""
+    items = [_item("A", item_type="book", title="Tlaxcala: Textos de su historia. Tomo I", date="1990",
+                   creators=[{"lastName": "Acuna"}]),
+             _item("B", item_type="book", title="Tlaxcala: Textos de su historia. Tomo II", date="1990",
+                   creators=[{"lastName": "Acuna"}])]
+    res = dedup_scan(items)
+    assert res["auto_accept_count"] == 0
+    assert "subtitle disagreement" in res["candidate_clusters"][0].conflicts
+
+
+def test_by_region_census_series_demotes():
+    """Audit FP [82/83/85/87/198]: census volumes split by state (subtitle Morelos vs Puebla vs Hidalgo)."""
+    items = [_item("A", item_type="book", title="IV Censos Agricola. 1960: Morelos", date="1965",
+                   creators=[{"lastName": "DGE"}]),
+             _item("B", item_type="book", title="IV Censos Agricola. 1960: Puebla", date="1965",
+                   creators=[{"lastName": "DGE"}]),
+             _item("C", item_type="book", title="IV Censos Agricola. 1960: Hidalgo", date="1965",
+                   creators=[{"lastName": "DGE"}])]
+    res = dedup_scan(items)
+    assert res["auto_accept_count"] == 0
+    assert "subtitle disagreement" in res["candidate_clusters"][0].conflicts
+
+
+def test_bare_vs_volume_designation_demotes():
+    """Audit FP [61]: bare series title vs '...: ...Volume 2' (empty-vs-one subtitle) -> volume disagreement."""
+    items = [_item("A", item_type="book", title="The Cambridge Economic History of Latin America",
+                   date="2006", creators=[{"lastName": "Bulmer"}]),
+             _item("B", item_type="book",
+                   title="The Cambridge Economic History of Latin America: The Long Twentieth Century Volume 2",
+                   date="2006", creators=[{"lastName": "Bulmer"}])]
+    res = dedup_scan(items)
+    assert res["auto_accept_count"] == 0
+    assert "volume/part disagreement" in res["candidate_clusters"][0].conflicts
+
+
+def test_empty_author_differing_editors_demotes():
+    """Audit FP/uncertain [186-189]: editor-only records (empty author key) with DIFFERENT editor sets."""
+    items = [_item("A", item_type="bookSection", title="Monumental Cityscape at Teotihuacan", date="2021",
+                   creators=_ed("Sugiyama")),
+             _item("B", item_type="bookSection", title="Monumental Cityscape at Teotihuacan", date="2021",
+                   creators=_ed("Hendon", "Joyce"))]
+    res = dedup_scan(items)
+    assert res["auto_accept_count"] == 0
+    assert "creator disagreement (weak key)" in res["candidate_clusters"][0].conflicts
+
+
+def test_empty_author_same_editors_reordered_still_auto_accepts():
+    """True dup [96-98]: editor-only records, SAME editor set in different order -> still auto-accept."""
+    items = [_item("A", item_type="bookSection", title="Small Towns 1270-1540", date="2000",
+                   creators=_ed("Palliser", "Dyer")),
+             _item("B", item_type="bookSection", title="Small Towns 1270-1540", date="2000",
+                   creators=_ed("Dyer", "Palliser"))]
+    assert dedup_scan(items)["auto_accept_count"] == 1
+
+
+def test_descriptive_subtitle_truncation_still_auto_accepts():
+    """True dup [15]: one record drops a DESCRIPTIVE subtitle (no 2nd subtitle, no volume marker) -> keep."""
+    items = [_item("A", item_type="book", title="Complex Population Dynamics", date="2003",
+                   creators=[{"lastName": "Turchin"}]),
+             _item("B", item_type="book", title="Complex Population Dynamics: A Theoretical Synthesis",
+                   date="2003", creators=[{"lastName": "Turchin"}])]
+    assert dedup_scan(items)["auto_accept_count"] == 1
