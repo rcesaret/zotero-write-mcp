@@ -280,16 +280,25 @@ def _rel_target_key(uri: Any) -> str:
     return str(uri).rstrip("/").rsplit("/", 1)[-1]
 
 
+# BBT-managed / identity fields enrichment + smart_fill must NEVER take from a duplicate (review #2): the
+# survivor's pinned citation key IS its identity — overwriting it with a dup's key silently breaks citations.
+_PROTECTED_FIELDS = frozenset({"citationKey"})
+
+
 def _enriched_fields(snapshot: ClusterSnapshot, field_sources: Optional[dict]) -> dict:
     """Resolve the owner-approved per-field source selections ``{field: source_member_key}`` to concrete
     values, taken VERBATIM from the named member's snapshot (Phase-B field-level metadata reconciliation).
     Fabrication is impossible — every value is an existing member field — and projection + verify both call
-    this so they agree on the expected enriched master. An unknown source, or a field the source lacks, is
-    skipped (the survivor's own value is then preserved)."""
+    this so they agree on the expected enriched master. SKIPS: a protected identity field (citationKey,
+    review #2), an unknown source, a field the source lacks, OR a source value that is EMPTY (review #1 —
+    enrichment may ADD or IMPROVE, never blank a populated survivor field; clearing a field must be a
+    separate explicit audited op, not a side effect of source selection)."""
     out: dict = {}
     for fld, src in (field_sources or {}).items():
+        if fld in _PROTECTED_FIELDS:                                   # review #2: never reconcile identity fields
+            continue
         src_item = snapshot.items.get(src)
-        if src_item is not None and fld in src_item.fields:
+        if src_item is not None and not _is_empty(src_item.fields.get(fld)):   # review #1: never blank a field
             out[fld] = src_item.fields[fld]
     return out
 
@@ -312,11 +321,28 @@ def _extra_add_tex_ids(extra_text: Optional[str], alias_keys: list) -> str:
     return "\n".join(other + [f"tex.ids: {', '.join(merged)}"])
 
 
+def _tex_ids_of(extra_text: Optional[str]) -> list:
+    """The citation-key aliases already declared in an item's ``extra`` via ``tex.ids:`` lines."""
+    out: list = []
+    for ln in str(extra_text or "").splitlines():
+        if ln.strip().lower().startswith("tex.ids:"):
+            out += [x.strip() for x in ln.split(":", 1)[1].split(",") if x.strip()]
+    return out
+
+
 def _alias_extra(snapshot: ClusterSnapshot, base_extra: Optional[str] = None) -> Optional[str]:
     """The survivor's ``extra`` with the trashed duplicates' BBT citekeys accumulated as ``tex.ids`` aliases
-    (so a manuscript citing a duplicate's ``@citekey`` still resolves post-merge). None when no secondary
-    carries a ``citationKey`` — nothing to preserve."""
-    alias_keys = [k for k in (snapshot.items[s].fields.get("citationKey") for s in snapshot.secondary_keys) if k]
+    (so a manuscript citing a duplicate's ``@citekey`` still resolves post-merge). Accumulates, per secondary,
+    its pinned ``citationKey`` AND the aliases it ALREADY carries in its own extra ``tex.ids`` (review #3:
+    transitive — a secondary that was itself a prior merge survivor keeps the inherited alias set). None when
+    nothing to preserve."""
+    alias_keys: list = []
+    for s in snapshot.secondary_keys:
+        sf = snapshot.items[s].fields
+        ck = sf.get("citationKey")
+        if ck:
+            alias_keys.append(ck)
+        alias_keys += _tex_ids_of(sf.get("extra"))
     if not alias_keys:
         return None
     base = base_extra if base_extra is not None else snapshot.items[snapshot.master_key].fields.get("extra")
@@ -385,11 +411,11 @@ def verify_merge(
     #     with the Phase-B owner-approved enrichment (field <- its chosen source member's value). With no
     #     field_sources this is pure survivor preservation; with them, a field NOT enriched to EXACTLY the
     #     approved value — or changed to anything else — is caught: obs.get(k) -> None/other != v.
-    expected_fields = dict(sm.fields)
-    expected_fields.update(_master_overrides(snapshot, field_sources))
+    overrides = _master_overrides(snapshot, field_sources)
+    expected_fields = {**sm.fields, **overrides}
     changed = []
     for k, v in expected_fields.items():
-        if _is_empty(v):
+        if _is_empty(v) and k not in overrides:        # skip empty survivor-own fields, but ALWAYS assert an override (review #1)
             continue
         if obs_m.fields.get(k) != v:
             changed.append(k)
@@ -506,7 +532,7 @@ def compute_merge_projection(
     if smart_fill:
         for it in sec:
             for k, v in it.fields.items():
-                if _is_empty(fields.get(k)) and not _is_empty(v):
+                if k not in _PROTECTED_FIELDS and _is_empty(fields.get(k)) and not _is_empty(v):
                     fields[k] = v
     fields.update(_master_overrides(snapshot, field_sources))   # Phase B: enrichment + citekey-alias accumulation
 

@@ -93,9 +93,10 @@ def normalize_subtitle(title: Any) -> str:
 # A differing volume/part/tome designation across cluster members => a multi-volume/part series, NOT a
 # duplicate. Requires a marker FOLLOWED BY a number/ordinal so a bare word ("part of the study") never trips.
 _VOL_RE = re.compile(
-    r"\b(volume|vol|tomo|tome|part|parte|band|fascicle|fasc|heft|libro|livre)\s+"
-    r"(\d{1,3}|i|ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii|xiii|xiv|xv|"
-    r"primer[oa]|segund[oa]|tercer[oa]|cuart[oa]|quint[oa]|first|second|third|fourth|fifth)\b"
+    r"\b(volume|volumen|vol|tomo|tome|part|parte|band|bd|fascicle|fasciculo|fasc|heft|libro|livre|"
+    r"seccion|section|capitulo|chapter|cuaderno|numero|teil)\s+"
+    r"(\d{1,4}|[ivxlcdm]+|primer[oa]|segund[oa]|tercer[oa]|cuart[oa]|quint[oa]|sext[oa]|"
+    r"first|second|third|fourth|fifth|sixth)\b"
 )
 
 
@@ -103,6 +104,24 @@ def _volume_signature(title_norm: str) -> frozenset:
     """Set of '<marker> <number>' volume designations in a FULL-normalized title (e.g. {'tomo ii'}). A
     differing signature across members (incl. present-vs-absent) marks distinct volumes -> demote."""
     return frozenset(f"{m.group(1)} {m.group(2)}" for m in _VOL_RE.finditer(title_norm))
+
+
+_TRAILING_NUMERAL = re.compile(r"[0-9]+|[ivxlcdm]+")
+
+
+def _is_truncation_prefix(a: str, b: str) -> bool:
+    """True if ``a`` is a same-work TRUNCATION prefix of ``b`` (a clipped re-import), NOT a different
+    volume/number. Rejects the case where ``b`` merely EXTENDS a trailing roman/arabic numeral of ``a``
+    (review #4: 'tomo xvi' -> 'tomo xvii', 'part i' -> 'part ii', 'foo 1' -> 'foo 12' are DISTINCT volumes,
+    not truncations) — only a mid-word continuation of a non-numeral token (e.g. 'mainte' -> 'maintenance')
+    is treated as a truncation."""
+    if not b.startswith(a):
+        return False
+    if len(b) > len(a) and b[len(a):len(a) + 1].isalnum():        # the prefix boundary falls mid-token
+        last = a.split()[-1] if a.split() else a
+        if _TRAILING_NUMERAL.fullmatch(last):                     # ...and a's trailing token is a numeral being extended
+            return False
+    return True
 
 
 def _creator_surnames(item: Any) -> frozenset:
@@ -132,7 +151,7 @@ def _distinguishing_field_conflicts(by_key: dict, keys: list) -> list:
     the title-based guards). ISBN is deliberately NOT here: hardcover/paperback of one edition share the
     work but differ in ISBN, so an ISBN conflict is a review FLAG, not an auto-demotion."""
     out: list = []
-    for fld in ("volume", "numberOfVolumes", "university", "institution"):
+    for fld in ("volume", "numberOfVolumes", "issue", "seriesNumber", "number", "university", "institution"):
         vals = {_WS.sub(" ", _strip_diacritics(str(_data(by_key[k]).get(fld) or "")).lower()).strip()
                 for k in keys}
         vals.discard("")
@@ -280,6 +299,20 @@ def _conflicts(by_key: dict, keys: list, *, path: str) -> list:
         out.append("item-type conflict")
     if _min_title_jaccard(by_key, keys) < TITLE_JACCARD_FLOOR:
         out.append("title disagreement")
+    # Physical-instance discriminators (review #6) run for BOTH paths: a diverging volume-subtitle, a volume
+    # designation, or a differing volume/issue/edition/university field marks DISTINCT works regardless of
+    # whether the cluster formed by exact DOI or by the normalized key (e.g. a multi-volume set sharing one
+    # set-level DOI). The subtitle the normalized key drops distinguishes multi-part / by-region / by-section
+    # works; demote when two non-empty subtitles DIVERGE — neither a truncation-prefix of the other. A clipped
+    # re-import or a descriptive subtitle merely ADDED to a bare main title stays auto-acceptable, but a
+    # trailing-numeral change ('tomo xvi' -> 'tomo xvii') is a divergence, not a truncation.
+    ne_subs = [s for s in {normalize_subtitle(_data(by_key[k]).get("title")) for k in keys} if s]
+    if any(not (_is_truncation_prefix(b, a) or _is_truncation_prefix(a, b))
+           for i, a in enumerate(ne_subs) for b in ne_subs[i + 1:]):
+        out.append("subtitle disagreement")
+    if len({_volume_signature(normalize_title_full(_data(by_key[k]).get("title"))) for k in keys}) > 1:
+        out.append("volume/part disagreement")
+    out.extend(_distinguishing_field_conflicts(by_key, keys))
     if path == "doi":
         years = {normalize_year(by_key[k]) for k in keys}
         years.discard("")
@@ -290,26 +323,11 @@ def _conflicts(by_key: dict, keys: list, *, path: str) -> list:
         dois.discard(None)
         if len(dois) > 1:
             out.append("DOI disagreement")
-        # 2026-06 exit-gate audit: the subtitle ``normalize_title`` drops distinguishes distinct works
-        # (multi-part / by-region / by-section) sharing the subtitle-stripped key. Demote only when two
-        # non-empty subtitles DIVERGE (neither is a prefix of the other); a clipped/truncated subtitle (a
-        # prefix) is a re-import of the same work, and a descriptive subtitle merely ADDED to a bare main
-        # title (one side empty) stays auto-acceptable (B2 true-duplicate case).
-        ne_subs = [s for s in {normalize_subtitle(_data(by_key[k]).get("title")) for k in keys} if s]
-        if any(not (a.startswith(b) or b.startswith(a))
-               for i, a in enumerate(ne_subs) for b in ne_subs[i + 1:]):
-            out.append("subtitle disagreement")
-        # A differing volume/part designation always marks distinct volumes — caught even when one subtitle
-        # is a prefix of another (e.g. 'tomo i' is a string-prefix of 'tomo ii').
-        if len({_volume_signature(normalize_title_full(_data(by_key[k]).get("title"))) for k in keys}) > 1:
-            out.append("volume/part disagreement")
-        # Creator disagreement: surnames present in some members but not shared by all. >=2 such surnames
-        # marks distinct works (different co-authors / editor sets) wearing the same title+year key — this
-        # catches both the empty-author (editor-only) collisions and same-first-author/different-co-author
-        # records. A lone missing/added co-author (1) is tolerated as a metadata-incomplete duplicate;
-        # author-ORDER variants (same set, reordered) have an empty disagreement set and stay auto-acceptable.
+        # Creator disagreement (key path only — a shared exact DOI is strong identity): surnames present in
+        # some members but not all. >=2 such marks distinct works (different co-authors / editor sets) wearing
+        # the same title+year key; a lone missing/added co-author is tolerated; author-ORDER variants (same
+        # set, reordered) stay auto-acceptable.
         csets = [_creator_surnames(by_key[k]) for k in keys]
         if len(frozenset().union(*csets) - frozenset.intersection(*csets)) >= 2:
             out.append("creator disagreement")
-        out.extend(_distinguishing_field_conflicts(by_key, keys))
     return out

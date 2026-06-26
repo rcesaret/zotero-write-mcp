@@ -123,7 +123,10 @@ def merge_cluster(
         return MergePlan(drifted=True, drift_keys=["<concurrent-edit-after-drift-check>"],
                          patches=patches, master_version=fresh_ver[m])
 
-    return MergePlan(drifted=False, patches=patches, master_version=fresh_ver[m])
+    # review #7: report the POST-PATCH master version so commit_merge can pin it and fail-closed if a
+    # concurrent edit lands in the window between this PATCH and the trash.
+    post_master_version = _unwrap(reader.get_item(m))[1]
+    return MergePlan(drifted=False, patches=patches, master_version=post_master_version)
 
 
 # ── commit_merge — verify-gated, enable-token + observability-gated, fail-closed trash ──────────────
@@ -257,6 +260,7 @@ def commit_merge(
     ceiling: int = DEFAULT_CEILING,
     freshness_window: float = DEFAULT_FRESHNESS_WINDOW,
     field_sources: Optional[dict] = None,
+    expected_master_version: Optional[int] = None,
 ) -> CommitResult:
     """M-4-disjoint serialization wrapper: claim the cluster's item keys so two overlapping clusters
     cannot be committed concurrently (a destructive op on a shared item must serialize), then delegate to
@@ -269,7 +273,7 @@ def commit_merge(
         return _commit_merge_inner(
             snapshot, reader, gateway, prov, library_id=library_id, library_type=library_type,
             smart_fill=smart_fill, now=now, ceiling=ceiling, freshness_window=freshness_window,
-            field_sources=field_sources)
+            field_sources=field_sources, expected_master_version=expected_master_version)
     finally:
         _release_cluster(cluster_keys)
 
@@ -287,6 +291,7 @@ def _commit_merge_inner(
     ceiling: int = DEFAULT_CEILING,
     freshness_window: float = DEFAULT_FRESHNESS_WINDOW,
     field_sources: Optional[dict] = None,
+    expected_master_version: Optional[int] = None,
 ) -> CommitResult:
     """Verify-gated, fail-closed commit. Re-verify the post-PATCH state, then TRASH the secondaries
     (PATCH ``deleted:1`` — never delete/purge), re-assert children (M-4), terminal-verify the final state
@@ -308,6 +313,18 @@ def _commit_merge_inner(
 
     # Re-read the post-PATCH state (secondaries still alive) and run the 11-check gate.
     observed = build_cluster(reader, m, sec)
+    # review #7: pin the master across the merge_cluster->commit window. If its version advanced beyond what
+    # merge_cluster produced, a concurrent edit landed; fail closed (rollback the PATCH, re-snapshot) instead
+    # of trashing on top of, or silently reverting, someone else's edit.
+    if expected_master_version is not None and observed.items[m].version != expected_master_version:
+        prov.record(activity="commit_merge_verify", item_key=m, snapshot_id=snapshot.snapshot_id,
+                    agent="merge-engine", tool_version=__version__,
+                    params={"pass": False, "failed": ["master-concurrently-edited"]})
+        rb = rollback_merge(snapshot, observed, gateway, library_id=library_id, library_type=library_type)
+        return CommitResult(mode=("rolled_back" if rb.ok else "rollback_failed"), verify_passed=False,
+                            rollback=rb,
+                            reason=f"master version {observed.items[m].version} != expected "
+                                   f"{expected_master_version}; concurrent edit between PATCH and commit — re-snapshot")
     report = verify_merge(snapshot, observed, smart_fill=smart_fill, field_sources=field_sources)
     if not report.passed:
         # OBS-4: record the verify FAIL so it enters the verify-pass-rate denominator.

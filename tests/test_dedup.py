@@ -321,3 +321,48 @@ def test_first_edition_vs_unmarked_still_auto_accepts():
              _item("B", item_type="book", title="Some Book", date="2000",
                    creators=[{"lastName": "Author"}])]
     assert dedup_scan(items)["auto_accept_count"] == 1
+
+
+# ── adversarial-review regressions (dedup) ──────────────────────────────────────
+
+def test_high_roman_volume_demotes():
+    """review #4: 'Tomo XVI' vs 'Tomo XVII' (beyond the old xv cap, AND a string-prefix pair) -> demote."""
+    items = [_item("A", item_type="book", title="Coleccion: Documentos Tomo XVI", date="1990",
+                   creators=[{"lastName": "Editor"}]),
+             _item("B", item_type="book", title="Coleccion: Documentos Tomo XVII", date="1990",
+                   creators=[{"lastName": "Editor"}])]
+    assert dedup_scan(items)["auto_accept_count"] == 0
+
+
+def test_seccion_roman_demotes():
+    """review #4: 'Seccion I' vs 'Seccion II' (string-prefix pair + new 'seccion' marker) -> demote."""
+    items = [_item("A", item_type="report", title="Instructivo: Seccion I", date="1977",
+                   creators=[{"lastName": "DETENAL"}]),
+             _item("B", item_type="report", title="Instructivo: Seccion II", date="1977",
+                   creators=[{"lastName": "DETENAL"}])]
+    assert dedup_scan(items)["auto_accept_count"] == 0
+
+
+def test_issue_conflict_demotes():
+    """review #5: same title+year+author+volume but different issue -> distinct installments."""
+    items = [_item("A", title="Annual Review", date="2010", creators=[{"lastName": "X"}], volume="5", issue="1"),
+             _item("B", title="Annual Review", date="2010", creators=[{"lastName": "X"}], volume="5", issue="2")]
+    res = dedup_scan(items)
+    assert res["auto_accept_count"] == 0
+    assert "issue disagreement" in res["candidate_clusters"][0].conflicts
+
+
+def test_doi_path_volume_conflict_demotes():
+    """review #6: same DOI but differing volume (field + subtitle) -> demote (guards now run on the DOI path)."""
+    items = [_item("A", item_type="book", title="Set: The Work Volume 1", date="2000", DOI="10.1/set", volume="1"),
+             _item("B", item_type="book", title="Set: The Work Volume 2", date="2000", DOI="10.1/set", volume="2")]
+    assert dedup_scan(items)["auto_accept_count"] == 0
+
+
+def test_truncated_subtitle_still_auto_accepts_after_review_fix():
+    """review #4 must not over-demote: a genuine mid-word truncation (not a numeral) still auto-accepts."""
+    items = [_item("A", item_type="book", date="1988", creators=[{"lastName": "Mountjoy"}],
+                   title="Traditional management: An ecological analysis of soil fertility"),
+             _item("B", item_type="book", date="1988", creators=[{"lastName": "Mountjoy"}],
+                   title="Traditional management: An ecological analysis of soil")]
+    assert dedup_scan(items)["auto_accept_count"] == 1

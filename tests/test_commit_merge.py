@@ -299,6 +299,24 @@ def test_m4_disjoint_blocks_overlapping_inflight(tmp_path, monkeypatch):
     assert res2.mode == "committed"                                  # proceeds once the claim is released
 
 
+# ── review #7: master version pinned across the merge_cluster -> commit window ───
+
+def test_review7_commit_blocks_on_concurrent_master_edit(tmp_path):
+    """A concurrent master edit between merge_cluster and commit_merge -> fail-closed, no trash. The
+    version-pin fires before the token/freshness gates, so no enable token is needed to exercise it."""
+    lib = FakeLibrary(make_raw())
+    prov = ProvenanceStore(tmp_path / "prov")
+    snap = snapshot_cluster(lib, "M1", ["M2"], prov=prov)
+    plan = merge_cluster(snap, lib, lib, library_id=11056739)
+    assert not plan.drifted
+    lib.update_item(11056739, "M1", {"title": "Concurrently Edited"}, lib.items["M1"]["version"])  # concurrent edit
+    res = commit_merge(snap, lib, lib, prov, library_id=11056739, now=NOW,
+                       expected_master_version=plan.master_version)
+    assert res.mode in ("rolled_back", "rollback_failed")
+    assert "concurrent" in (res.reason or "")
+    assert lib.items["M2"]["data"].get("deleted") in (None, 0)       # secondary NOT trashed
+
+
 # ── R-3: a rollback whose own op fails escalates to mode='rollback_failed' ───
 
 class RevertFailLibrary(FakeLibrary):

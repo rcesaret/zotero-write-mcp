@@ -174,3 +174,45 @@ def test_verify_accepts_alias_and_rejects_missing(tmp_path):
 def test_no_secondary_citekey_no_alias(tmp_path):
     proj = compute_merge_projection(_snap(tmp_path))             # M2 has no citationKey
     assert not proj.items["M1"].fields.get("extra")
+
+
+# ── adversarial-review regressions ──────────────────────────────────────────────
+
+def test_empty_source_value_does_not_clobber_and_gate_catches_clobber(tmp_path):
+    """review #1: an override whose source value is EMPTY must NOT blank the survivor, and the gate must
+    still be able to catch a clobber of that field (no _is_empty blind spot for override-eligible fields)."""
+    items = {
+        "M1": _item("M1", 100, title="Real Title", date="1979", place="Mexico City", collections=[], tags=[], relations={}),
+        "M2": _item("M2", 101, title="Real Title", date="1979", place="", collections=[], tags=[], relations={}),
+    }
+    snap = snapshot_cluster(_Reader(items), "M1", ["M2"], prov=ProvenanceStore(tmp_path))
+    proj = compute_merge_projection(snap, field_sources={"place": "M2"})
+    assert proj.items["M1"].fields["place"] == "Mexico City"     # NOT blanked by the empty source
+    assert verify_merge(snap, proj, field_sources={"place": "M2"}).passed
+    clobbered = copy.deepcopy(proj)
+    clobbered.items["M1"].fields["place"] = ""                   # someone blanks it anyway
+    assert "master-scalar-preservation" in _failed(verify_merge(snap, clobbered, field_sources={"place": "M2"}))
+
+
+def test_citationKey_protected_from_field_sources(tmp_path):
+    """review #2: field_sources naming citationKey must NOT overwrite the survivor's pinned key."""
+    items = {
+        "M1": _item("M1", 100, title="T", date="1979", citationKey="survivorKey", collections=[], tags=[], relations={}),
+        "M2": _item("M2", 101, title="T", date="1979", citationKey="dupKey", collections=[], tags=[], relations={}),
+    }
+    snap = snapshot_cluster(_Reader(items), "M1", ["M2"], prov=ProvenanceStore(tmp_path))
+    proj = compute_merge_projection(snap, field_sources={"citationKey": "M2"})
+    assert proj.items["M1"].fields["citationKey"] == "survivorKey"          # protected
+    assert "tex.ids: dupKey" in proj.items["M1"].fields["extra"]            # dup key preserved as an ALIAS instead
+
+
+def test_transitive_alias_accumulates_secondary_tex_ids(tmp_path):
+    """review #3: a secondary that already carries tex.ids aliases passes them transitively to the survivor."""
+    items = {
+        "M1": _item("M1", 100, title="T", date="1979", collections=[], tags=[], relations={}),
+        "M2": _item("M2", 101, title="T", date="1979", citationKey="dupKey",
+                    extra="tex.ids: oldAliasA, oldAliasB", collections=[], tags=[], relations={}),
+    }
+    snap = snapshot_cluster(_Reader(items), "M1", ["M2"], prov=ProvenanceStore(tmp_path))
+    extra = compute_merge_projection(snap).items["M1"].fields["extra"]
+    assert all(k in extra for k in ("dupKey", "oldAliasA", "oldAliasB"))
