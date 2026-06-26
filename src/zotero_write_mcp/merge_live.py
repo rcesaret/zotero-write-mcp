@@ -49,6 +49,7 @@ def merge_cluster(
     library_id: int,
     smart_fill: bool = False,
     library_type: str = "user",
+    field_sources: Optional[dict] = None,
 ) -> MergePlan:
     """PATCH phase of a merge: PATCH the master with the unioned projection (collections/tags/relations +
     dc:replaces) and re-parent every child to the master. **NO delete** — fully reversible via
@@ -81,7 +82,8 @@ def merge_cluster(
 
     # 2. Projection (golden target) -> master PATCH body (union of collections/tags/relations + dc:replaces).
     base = library_item_base(library_type, library_id)
-    proj = compute_merge_projection(snapshot, smart_fill=smart_fill, library_base=base)
+    proj = compute_merge_projection(snapshot, smart_fill=smart_fill, library_base=base,
+                                    field_sources=field_sources)
     pm = proj.items[m]
     master_data: dict = {
         "collections": pm.collections,
@@ -96,6 +98,13 @@ def merge_cluster(
         for k, v in pm.fields.items():
             if _is_empty(snap_fields.get(k)) and not _is_empty(v) and _is_empty(live.get(k)):
                 master_data[k] = v
+    # Phase B: apply the owner-approved field-level enrichment (each reconciled field <- its chosen source
+    # member's value, taken from the projection). The drift check above + retry_on_412=False guarantee the
+    # live master is unchanged since the snapshot, so overwriting its scalar fields never clobbers a
+    # concurrent edit; verify_merge check #3 (also given field_sources) confirms the result is EXACTLY this.
+    for fld in (field_sources or {}):
+        if fld in pm.fields:
+            master_data[fld] = pm.fields[fld]
 
     # 3. Execute fail-closed (retry_on_412=False): a 412 = a concurrent edit landed AFTER the drift
     #    check -> abort (report the partial so the caller can rollback + re-snapshot), never blind-re-apply
@@ -166,7 +175,7 @@ def _reassert_children(snapshot, post, gateway, library_id, library_type) -> boo
     return True
 
 
-def _terminal_verify(snapshot, final, sec_keys, *, library_base, smart_fill=False) -> TerminalReport:
+def _terminal_verify(snapshot, final, sec_keys, *, library_base, smart_fill=False, field_sources=None) -> TerminalReport:
     """C-5: scoped re-verify of the FINAL committed state (the full 11-check verify cannot run here — the
     secondaries' versions legitimately changed via the trash). Asserts: every child live + parented to
     master; annotation parity + storage integrity per attachment; every secondary present AND trashed;
@@ -194,7 +203,8 @@ def _terminal_verify(snapshot, final, sec_keys, *, library_base, smart_fill=Fals
         if si is None or not _is_trashed(si):
             failed.append(f"secondary-not-trashed:{k}")
     # F5: the master must still match the merge projection (collections/tags/relations + scalar fields).
-    proj_m = compute_merge_projection(snapshot, smart_fill=smart_fill, library_base=library_base).items[m]
+    proj_m = compute_merge_projection(snapshot, smart_fill=smart_fill, library_base=library_base,
+                                      field_sources=field_sources).items[m]
     fm = final.items.get(m)
     if fm is None:
         failed.append("master-absent")
@@ -207,7 +217,7 @@ def _terminal_verify(snapshot, final, sec_keys, *, library_base, smart_fill=Fals
             if not set(_as_list(vals)) <= set(_as_list(fm.relations.get(pred))):
                 failed.append("master-relations")
                 break
-        for fk, v in snapshot.items[m].fields.items():
+        for fk, v in proj_m.fields.items():       # F5 expects the ENRICHED master (== projection), Phase B
             if not _is_empty(v) and fm.fields.get(fk) != v:
                 failed.append(f"master-field:{fk}")
                 break
@@ -246,6 +256,7 @@ def commit_merge(
     now: Optional[datetime] = None,
     ceiling: int = DEFAULT_CEILING,
     freshness_window: float = DEFAULT_FRESHNESS_WINDOW,
+    field_sources: Optional[dict] = None,
 ) -> CommitResult:
     """M-4-disjoint serialization wrapper: claim the cluster's item keys so two overlapping clusters
     cannot be committed concurrently (a destructive op on a shared item must serialize), then delegate to
@@ -257,7 +268,8 @@ def commit_merge(
     try:
         return _commit_merge_inner(
             snapshot, reader, gateway, prov, library_id=library_id, library_type=library_type,
-            smart_fill=smart_fill, now=now, ceiling=ceiling, freshness_window=freshness_window)
+            smart_fill=smart_fill, now=now, ceiling=ceiling, freshness_window=freshness_window,
+            field_sources=field_sources)
     finally:
         _release_cluster(cluster_keys)
 
@@ -274,6 +286,7 @@ def _commit_merge_inner(
     now: Optional[datetime] = None,
     ceiling: int = DEFAULT_CEILING,
     freshness_window: float = DEFAULT_FRESHNESS_WINDOW,
+    field_sources: Optional[dict] = None,
 ) -> CommitResult:
     """Verify-gated, fail-closed commit. Re-verify the post-PATCH state, then TRASH the secondaries
     (PATCH ``deleted:1`` — never delete/purge), re-assert children (M-4), terminal-verify the final state
@@ -295,7 +308,7 @@ def _commit_merge_inner(
 
     # Re-read the post-PATCH state (secondaries still alive) and run the 11-check gate.
     observed = build_cluster(reader, m, sec)
-    report = verify_merge(snapshot, observed, smart_fill=smart_fill)
+    report = verify_merge(snapshot, observed, smart_fill=smart_fill, field_sources=field_sources)
     if not report.passed:
         # OBS-4: record the verify FAIL so it enters the verify-pass-rate denominator.
         prov.record(activity="commit_merge_verify", item_key=m, snapshot_id=snapshot.snapshot_id,
@@ -333,7 +346,8 @@ def _commit_merge_inner(
                          agent="merge-engine", tool_version=__version__,
                          params={"secondaries": sec,
                                  "expected_versions": {k: observed.items[k].version for k in sec},
-                                 "smart_fill": smart_fill, "smart_filled_fields": smart_filled})
+                                 "smart_fill": smart_fill, "smart_filled_fields": smart_filled,
+                                 "field_sources": field_sources})
 
     # TRASH each secondary via PATCH deleted:1 (TRASH-NOT-PURGE), sequentially (gateway honors Backoff).
     # retry_on_412=False so a concurrent edit ABORTS to rollback (F6); the handler catches ANY failure
@@ -366,7 +380,7 @@ def _commit_merge_inner(
     final = build_cluster(reader, m, sec)
     terminal = _terminal_verify(snapshot, final, sec,
                                 library_base=library_item_base(library_type, library_id),
-                                smart_fill=smart_fill)
+                                smart_fill=smart_fill, field_sources=field_sources)
     if not terminal.passed:
         # OBS-4: the terminal verify is a verify -> record its FAIL into the rate.
         prov.record(activity="commit_merge_verify", item_key=m, snapshot_id=snapshot.snapshot_id,

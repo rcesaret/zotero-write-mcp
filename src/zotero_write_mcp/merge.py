@@ -280,17 +280,34 @@ def _rel_target_key(uri: Any) -> str:
     return str(uri).rstrip("/").rsplit("/", 1)[-1]
 
 
+def _enriched_fields(snapshot: ClusterSnapshot, field_sources: Optional[dict]) -> dict:
+    """Resolve the owner-approved per-field source selections ``{field: source_member_key}`` to concrete
+    values, taken VERBATIM from the named member's snapshot (Phase-B field-level metadata reconciliation).
+    Fabrication is impossible — every value is an existing member field — and projection + verify both call
+    this so they agree on the expected enriched master. An unknown source, or a field the source lacks, is
+    skipped (the survivor's own value is then preserved)."""
+    out: dict = {}
+    for fld, src in (field_sources or {}).items():
+        src_item = snapshot.items.get(src)
+        if src_item is not None and fld in src_item.fields:
+            out[fld] = src_item.fields[fld]
+    return out
+
+
 def verify_merge(
     snapshot: ClusterSnapshot,
     observed: ClusterSnapshot,
     *,
     smart_fill: bool = False,
+    field_sources: Optional[dict] = None,
 ) -> IntegrityReport:
     """The 11-check fail-closed gate. Compares the before-image ``snapshot`` to the post-merge
     (live or projected) ``observed`` cluster state; passes only if EVERY check passes (§7).
 
     All expectations are recomputed **independently from the snapshot** (never trusting the observed
-    union); each check maps to a Stage-E C-1.x corruption. Pure function — no I/O.
+    union); each check maps to a Stage-E C-1.x corruption. Pure function — no I/O. ``field_sources`` (Phase B)
+    threads the owner-approved metadata reconciliation so check #3 expects the ENRICHED master (each field
+    == its chosen source member's value) rather than bare survivor preservation.
     """
     checks: list = []
     m = snapshot.master_key
@@ -322,17 +339,20 @@ def verify_merge(
              if observed.items.get(k) is None or observed.items[k].version != snapshot.items[k].version]
     add(2, "version-drift", not drift, f"secondaries with version drift={drift}")
 
-    # 3 — master scalar-field preservation: every non-empty snapshot scalar (incl. creators) byte-
-    #     identical; smart_fill may only fill snapshot-EMPTY fields (those are not iterated here, so the
-    #     smart_fill flag needs no special handling in this gate — it is accepted for call-site symmetry).
-    #     A field deleted in observed (present non-empty in snapshot) is caught: obs.get(k) -> None != v.
+    # 3 — master scalar-field preservation / approved enrichment: each non-empty EXPECTED master scalar
+    #     (incl. creators) is byte-identical in observed. EXPECTED = the snapshot master's fields overlaid
+    #     with the Phase-B owner-approved enrichment (field <- its chosen source member's value). With no
+    #     field_sources this is pure survivor preservation; with them, a field NOT enriched to EXACTLY the
+    #     approved value — or changed to anything else — is caught: obs.get(k) -> None/other != v.
+    expected_fields = dict(sm.fields)
+    expected_fields.update(_enriched_fields(snapshot, field_sources))
     changed = []
-    for k, v in sm.fields.items():
+    for k, v in expected_fields.items():
         if _is_empty(v):
             continue
         if obs_m.fields.get(k) != v:
             changed.append(k)
-    add(3, "master-scalar-preservation", not changed, f"overwritten master fields={changed}")
+    add(3, "master-scalar-preservation", not changed, f"master fields != approved survivor={changed}")
 
     # 4 — collections EQUALITY vs independently-recomputed union (==, not superset)
     expected_cols = set()
@@ -412,6 +432,7 @@ def compute_merge_projection(
     *,
     smart_fill: bool = False,
     library_base: str = "http://zotero.org/users/0/items",
+    field_sources: Optional[dict] = None,
 ) -> ClusterSnapshot:
     """Compute what a merge WOULD produce, purely from the snapshot — NO writes (this is the heart
     of shadow mode). The master gets the unioned collections/tags/relations + ``dc:replaces``→each
@@ -446,6 +467,7 @@ def compute_merge_projection(
             for k, v in it.fields.items():
                 if _is_empty(fields.get(k)) and not _is_empty(v):
                     fields[k] = v
+    fields.update(_enriched_fields(snapshot, field_sources))   # Phase B: approved field-level enrichment wins
 
     proj_master = ItemSnap(
         key=m, version=sm.version + 1, item_type=sm.item_type,
@@ -608,6 +630,7 @@ def shadow_merge(
     smart_fill: bool = False,
     observed: Optional[ClusterSnapshot] = None,
     library_base: str = "http://zotero.org/users/0/items",
+    field_sources: Optional[dict] = None,
 ) -> ShadowReport:
     """Shadow mode: ``snapshot → compute projection → verify → LOG``. **No writes** — this function
     takes no gateway and structurally cannot commit (ADR-004 shadow phase: the isolation mechanism that
@@ -619,9 +642,10 @@ def shadow_merge(
     the live dc:replaces smoke verifies a real merge.
     """
     snap = snapshot_cluster(reader, master_key, dup_keys, prov=prov)
-    projection = compute_merge_projection(snap, smart_fill=smart_fill, library_base=library_base)
+    projection = compute_merge_projection(snap, smart_fill=smart_fill, library_base=library_base,
+                                          field_sources=field_sources)
     state = observed if observed is not None else projection
-    report = verify_merge(snap, state, smart_fill=smart_fill)
+    report = verify_merge(snap, state, smart_fill=smart_fill, field_sources=field_sources)
     prov.record(
         activity="shadow_merge", item_key=master_key, snapshot_id=snap.snapshot_id,
         agent="merge-engine", tool_version=__version__,
