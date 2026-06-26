@@ -116,6 +116,33 @@ def _creator_surnames(item: Any) -> frozenset:
     return frozenset(out)
 
 
+# A 1st/unmarked edition is the baseline -> collapses to '' so only a NON-first edition that is not shared
+# by all members triggers a demotion (a 2nd/revised edition is a distinct work; #75 in the 2026-06 review).
+_FIRST_EDITION = frozenset(["", "1", "1.", "1st", "first", "first edition", "primera", "primera edicion"])
+
+
+def _norm_edition(v: Any) -> str:
+    s = _WS.sub(" ", _strip_diacritics(str(v or "")).lower()).strip()
+    return "" if s in _FIRST_EDITION else s
+
+
+def _distinguishing_field_conflicts(by_key: dict, keys: list) -> list:
+    """Demote when members of a title+year+author cluster disagree on a field that distinguishes physical
+    volumes / institutional deposits / editions (2026-06 reconciliation finding — these are invisible to
+    the title-based guards). ISBN is deliberately NOT here: hardcover/paperback of one edition share the
+    work but differ in ISBN, so an ISBN conflict is a review FLAG, not an auto-demotion."""
+    out: list = []
+    for fld in ("volume", "numberOfVolumes", "university", "institution"):
+        vals = {_WS.sub(" ", _strip_diacritics(str(_data(by_key[k]).get(fld) or "")).lower()).strip()
+                for k in keys}
+        vals.discard("")
+        if len(vals) > 1:
+            out.append(f"{fld} disagreement")
+    if len({_norm_edition(_data(by_key[k]).get("edition")) for k in keys}) > 1:
+        out.append("edition disagreement")
+    return out
+
+
 def normalize_year(item: Any) -> str:
     d = _data(item)
     for fld in ("date", "year", "issued"):
@@ -284,4 +311,5 @@ def _conflicts(by_key: dict, keys: list, *, path: str) -> list:
         csets = [_creator_surnames(by_key[k]) for k in keys]
         if len(frozenset().union(*csets) - frozenset.intersection(*csets)) >= 2:
             out.append("creator disagreement")
+        out.extend(_distinguishing_field_conflicts(by_key, keys))
     return out

@@ -268,3 +268,56 @@ def test_descriptive_subtitle_truncation_still_auto_accepts():
              _item("B", item_type="book", title="Complex Population Dynamics: A Theoretical Synthesis",
                    date="2003", creators=[{"lastName": "Turchin"}])]
     assert dedup_scan(items)["auto_accept_count"] == 1
+
+
+# ── 2026-06 reconciliation finding: distinguishing-field conflicts the title-based guards can't see ──
+
+def test_volume_field_conflict_demotes():
+    """Reconciliation #72: identical title+author+year but different `volume` field -> distinct volumes."""
+    items = [_item("A", item_type="book", title="Mexicaltzingo", date="1991",
+                   creators=[{"lastName": "Avila Lopez"}], volume="1"),
+             _item("B", item_type="book", title="Mexicaltzingo", date="1991",
+                   creators=[{"lastName": "Avila Lopez"}], volume="2")]
+    res = dedup_scan(items)
+    assert res["auto_accept_count"] == 0
+    assert "volume disagreement" in res["candidate_clusters"][0].conflicts
+
+
+def test_university_conflict_demotes():
+    """Reconciliation #58: same thesis title+author+year but different university -> distinct deposit."""
+    items = [_item("A", item_type="thesis", title="Agricultura Sustentable", date="2020",
+                   creators=[{"lastName": "Garduno"}], university="Universidad Autonoma del Estado de Mexico"),
+             _item("B", item_type="thesis", title="Agricultura Sustentable", date="2020",
+                   creators=[{"lastName": "Garduno"}], university="Universidad Nacional Autonoma de Mexico")]
+    res = dedup_scan(items)
+    assert res["auto_accept_count"] == 0
+    assert "university disagreement" in res["candidate_clusters"][0].conflicts
+
+
+def test_edition_present_vs_unmarked_demotes():
+    """Reconciliation #75: a non-first edition on only one record -> distinct editions."""
+    items = [_item("A", item_type="book", title="Plague Population", date="1977",
+                   creators=[{"lastName": "Hatcher"}]),
+             _item("B", item_type="book", title="Plague Population", date="1977",
+                   creators=[{"lastName": "Hatcher"}], edition="2")]
+    res = dedup_scan(items)
+    assert res["auto_accept_count"] == 0
+    assert "edition disagreement" in res["candidate_clusters"][0].conflicts
+
+
+def test_same_volume_true_dup_still_auto_accepts():
+    """Matching distinguishing fields (same volume) must NOT trip the new guard."""
+    items = [_item("A", item_type="journalArticle", title="Soil Erosion", date="1985",
+                   creators=[{"lastName": "Blaikie"}], volume="12"),
+             _item("B", item_type="journalArticle", title="Soil erosion", date="1985",
+                   creators=[{"lastName": "Blaikie"}], volume="12")]
+    assert dedup_scan(items)["auto_accept_count"] == 1
+
+
+def test_first_edition_vs_unmarked_still_auto_accepts():
+    """Edition '1' vs unmarked both collapse to the 1st-edition baseline -> still auto-accept."""
+    items = [_item("A", item_type="book", title="Some Book", date="2000",
+                   creators=[{"lastName": "Author"}], edition="1"),
+             _item("B", item_type="book", title="Some Book", date="2000",
+                   creators=[{"lastName": "Author"}])]
+    assert dedup_scan(items)["auto_accept_count"] == 1
