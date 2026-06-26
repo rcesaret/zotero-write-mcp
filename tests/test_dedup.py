@@ -175,15 +175,16 @@ def _ed(*surnames):
     return [{"creatorType": "editor", "lastName": s} for s in surnames]
 
 
-def test_multi_volume_subtitle_demotes():
-    """Audit FP [56]: same main-title key + author + year, but subtitles differ by volume (Tomo I vs II)."""
+def test_multi_volume_tomo_demotes():
+    """Audit FP [56]: 'Tomo I' vs 'Tomo II' — caught by the volume guard ('tomo i' is a string-prefix of
+    'tomo ii', so the subtitle prefix-relaxation passes it through to the volume/part check)."""
     items = [_item("A", item_type="book", title="Tlaxcala: Textos de su historia. Tomo I", date="1990",
                    creators=[{"lastName": "Acuna"}]),
              _item("B", item_type="book", title="Tlaxcala: Textos de su historia. Tomo II", date="1990",
                    creators=[{"lastName": "Acuna"}])]
     res = dedup_scan(items)
     assert res["auto_accept_count"] == 0
-    assert "subtitle disagreement" in res["candidate_clusters"][0].conflicts
+    assert "volume/part disagreement" in res["candidate_clusters"][0].conflicts
 
 
 def test_by_region_census_series_demotes():
@@ -219,7 +220,36 @@ def test_empty_author_differing_editors_demotes():
                    creators=_ed("Hendon", "Joyce"))]
     res = dedup_scan(items)
     assert res["auto_accept_count"] == 0
-    assert "creator disagreement (weak key)" in res["candidate_clusters"][0].conflicts
+    assert "creator disagreement" in res["candidate_clusters"][0].conflicts
+
+
+def test_diverging_coauthors_same_first_author_demotes():
+    """Audit uncertain [63/73/89]: same title+year+FIRST author but >=2 differing co-authors -> demote."""
+    items = [_item("A", title="Nitrogen Fertilization for Maize", date="2022",
+                   creators=[{"lastName": "Sanchez"}, {"lastName": "Ortiz"}, {"lastName": "Volke"}]),
+             _item("B", title="Nitrogen Fertilization for Maize", date="2022",
+                   creators=[{"lastName": "Sanchez"}, {"lastName": "Verhulst"}, {"lastName": "Govaerts"}])]
+    res = dedup_scan(items)
+    assert res["auto_accept_count"] == 0
+    assert "creator disagreement" in res["candidate_clusters"][0].conflicts
+
+
+def test_one_missing_coauthor_still_auto_accepts():
+    """A lone missing/added co-author (disagreement == 1) is tolerated as a metadata-incomplete duplicate."""
+    items = [_item("A", title="Cultivated Landscapes", date="2001",
+                   creators=[{"lastName": "Whitmore"}, {"lastName": "Turner"}]),
+             _item("B", title="Cultivated Landscapes", date="2001",
+                   creators=[{"lastName": "Whitmore"}])]
+    assert dedup_scan(items)["auto_accept_count"] == 1
+
+
+def test_truncated_subtitle_prefix_still_auto_accepts():
+    """Prefix-relaxation: a clipped/truncated subtitle (a string-prefix of the full) is a re-import, kept."""
+    items = [_item("A", item_type="book", date="1988", creators=[{"lastName": "Mountjoy"}],
+                   title="Traditional management of a hillside agroecosystem: An ecological"),
+             _item("B", item_type="book", date="1988", creators=[{"lastName": "Mountjoy"}],
+                   title="Traditional management of a hillside agroecosystem: An ecological analysis of soil")]
+    assert dedup_scan(items)["auto_accept_count"] == 1
 
 
 def test_empty_author_same_editors_reordered_still_auto_accepts():

@@ -263,20 +263,25 @@ def _conflicts(by_key: dict, keys: list, *, path: str) -> list:
         dois.discard(None)
         if len(dois) > 1:
             out.append("DOI disagreement")
-        # 2026-06 exit-gate audit: the subtitle ``normalize_title`` drops, or a volume designation,
-        # distinguishes distinct works (multi-volume / multi-part / by-region / by-section) that share the
-        # subtitle-stripped key. A DESCRIPTIVE subtitle merely ADDED to one side (bare main title on the
-        # other, no second subtitle, no volume marker) is left auto-acceptable (B2 true-duplicate case).
-        subs = {normalize_subtitle(_data(by_key[k]).get("title")) for k in keys}
-        subs.discard("")
-        if len(subs) > 1:
+        # 2026-06 exit-gate audit: the subtitle ``normalize_title`` drops distinguishes distinct works
+        # (multi-part / by-region / by-section) sharing the subtitle-stripped key. Demote only when two
+        # non-empty subtitles DIVERGE (neither is a prefix of the other); a clipped/truncated subtitle (a
+        # prefix) is a re-import of the same work, and a descriptive subtitle merely ADDED to a bare main
+        # title (one side empty) stays auto-acceptable (B2 true-duplicate case).
+        ne_subs = [s for s in {normalize_subtitle(_data(by_key[k]).get("title")) for k in keys} if s]
+        if any(not (a.startswith(b) or b.startswith(a))
+               for i, a in enumerate(ne_subs) for b in ne_subs[i + 1:]):
             out.append("subtitle disagreement")
+        # A differing volume/part designation always marks distinct volumes — caught even when one subtitle
+        # is a prefix of another (e.g. 'tomo i' is a string-prefix of 'tomo ii').
         if len({_volume_signature(normalize_title_full(_data(by_key[k]).get("title"))) for k in keys}) > 1:
             out.append("volume/part disagreement")
-        # weak key: the ASySD key matched on an EMPTY first-author (editor-only / anonymous). Require the
-        # full creator surname SETS to agree, else distinct chapters wear the same (title, year, '') mask.
-        # (Same-set-different-order editors stay auto-acceptable — a genuine author-order duplicate.)
-        if not all(first_author_surname(by_key[k]) for k in keys) \
-                and len({_creator_surnames(by_key[k]) for k in keys}) > 1:
-            out.append("creator disagreement (weak key)")
+        # Creator disagreement: surnames present in some members but not shared by all. >=2 such surnames
+        # marks distinct works (different co-authors / editor sets) wearing the same title+year key — this
+        # catches both the empty-author (editor-only) collisions and same-first-author/different-co-author
+        # records. A lone missing/added co-author (1) is tolerated as a metadata-incomplete duplicate;
+        # author-ORDER variants (same set, reordered) have an empty disagreement set and stay auto-acceptable.
+        csets = [_creator_surnames(by_key[k]) for k in keys]
+        if len(frozenset().union(*csets) - frozenset.intersection(*csets)) >= 2:
+            out.append("creator disagreement")
     return out
