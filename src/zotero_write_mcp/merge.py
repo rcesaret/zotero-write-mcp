@@ -599,6 +599,12 @@ def rollback_merge(
     if obs_m is not None and master_changed:
         revert = {**sm.fields, "collections": sm.collections,
                   "tags": _zotero_tags(sm.tags), "relations": sm.relations}
+        # Clear any scalar field the merge ADDED to the master (present in observed, absent in the snapshot
+        # — e.g. a Phase-B enrichment or smart_fill field like publisher) so the revert fully restores the
+        # survivor: a PATCH leaves omitted fields unchanged, so an added field needs an explicit "".
+        for fk in obs_m.fields:
+            if fk not in revert:
+                revert[fk] = ""
         _do({"op": "revert-master", "key": m},
             lambda: gateway.update_item(library_id, m, revert, obs_m.version, library_type=library_type))
 

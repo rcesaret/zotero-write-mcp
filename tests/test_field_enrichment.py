@@ -8,6 +8,7 @@ import copy
 
 from zotero_write_mcp.merge import (
     snapshot_cluster, compute_merge_projection, verify_merge, _enriched_fields,
+    build_cluster, rollback_merge,
 )
 from zotero_write_mcp.provenance import ProvenanceStore
 
@@ -100,3 +101,33 @@ def test_no_field_sources_is_pure_preservation(tmp_path):
     proj.items["M1"].fields["title"] = "Basin of Mexico: An Ecological Study"   # changed WITHOUT approval
     r = verify_merge(snap, proj)
     assert not r.passed and "master-scalar-preservation" in _failed(r)
+
+
+class _CaptureGateway:
+    def __init__(self):
+        self.calls = []
+
+    def update_item(self, library_id, key, data, version, *, library_type="user", **kw):
+        self.calls.append({"key": key, "data": data})
+
+    def create_items(self, library_id, objects, *, library_type="user", **kw):
+        self.calls.append({"create": objects})
+
+
+def test_rollback_clears_enrichment_added_field(tmp_path):
+    """Rollback must revert a CHANGED survivor field AND clear an enrichment-ADDED one (publisher)."""
+    snap = _snap(tmp_path)   # M1: short title, NO publisher | M2: full title + publisher
+    enriched = {
+        "M1": _item("M1", 101, title="Basin of Mexico: An Ecological Study", date="1979",
+                    publisher="Academic Press", collections=[], tags=[],
+                    relations={"dc:replaces": ["http://zotero.org/users/0/items/M2"]}),
+        "M2": _item("M2", 102, title="Basin of Mexico: An Ecological Study", date="1979",
+                    publisher="Academic Press", collections=[], tags=[], relations={}, deleted=1),
+    }
+    observed = build_cluster(_Reader(enriched), "M1", ["M2"])
+    gw = _CaptureGateway()
+    rb = rollback_merge(snap, observed, gw, library_id=1)
+    assert rb.ok
+    revert = next(c["data"] for c in gw.calls if c["key"] == "M1" and "title" in c["data"])
+    assert revert["title"] == "Basin of Mexico"      # CHANGED field reverted to the survivor's original
+    assert revert["publisher"] == ""                 # ADDED field explicitly cleared
