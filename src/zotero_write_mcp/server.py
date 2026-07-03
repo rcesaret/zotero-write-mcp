@@ -22,7 +22,7 @@ from zotero_write_mcp.merge import (
 )
 from zotero_write_mcp.merge_live import (
     merge_cluster as _eng_merge, commit_merge as _eng_commit, load_snapshot as _eng_load_snapshot,
-    WebClusterReader,
+    reconcile_orphan_commits as _eng_reconcile, WebClusterReader,
 )
 from zotero_write_mcp.dedup import dedup_scan as _eng_dedup
 from zotero_write_mcp.observability import query_provenance as _eng_query_prov, daily_report as _eng_daily
@@ -40,12 +40,48 @@ mcp = FastMCP(
 # Lazy-initialized client
 _client: Optional[ZoteroClient] = None
 
+# Summary of the most-recent startup crash-recovery (F4 reconcile) pass; exposed via reconcile_orphans.
+_startup_reconcile: Optional[dict] = None
+
 
 def get_client() -> ZoteroClient:
     global _client
     if _client is None:
         _client = ZoteroClient()
+        _run_startup_reconcile(_client)   # F4 crash-recovery before the merge chain resumes (REV5 finding 3)
     return _client
+
+
+def _run_startup_reconcile(zot: ZoteroClient) -> dict:
+    """Roll back any orphaned ``commit_merge_intent`` (a live merge that crashed mid-trash — intent
+    logged, no result) from its snapshot, at client init, BEFORE the merge chain resumes. Read-safe:
+    ``reconcile_orphan_commits`` performs only the sanctioned rollback (un-trash + revert + reparent,
+    never purge/recreate on the trash path) and is a no-op when there are no orphans — the common case
+    (orphans exist only after a real live-merge crash). An orphan whose snapshot blob is MISSING is
+    surfaced LOUDLY (non-recoverable — needs human recovery), never a silent skip. A failure here never
+    bricks client init."""
+    global _startup_reconcile
+    summary = {"orphans_found": 0, "reconciled": 0, "rollback_failed": 0,
+               "no_snapshot_blob": [], "error": None}
+    try:
+        reader = WebClusterReader(zot, zot.library_id)
+        outcomes = _eng_reconcile(zot.prov, reader, zot.gateway, library_id=zot.library_id)
+        summary["orphans_found"] = len(outcomes)
+        summary["reconciled"] = sum(1 for o in outcomes if o.get("status") == "reconciled")
+        summary["rollback_failed"] = sum(1 for o in outcomes if o.get("status") == "rollback_failed")
+        summary["no_snapshot_blob"] = [o.get("snapshot_id") for o in outcomes
+                                       if o.get("status") == "no-snapshot-blob"]
+    except Exception as e:                       # never let recovery brick the server
+        summary["error"] = f"{type(e).__name__}: {e}"
+    if summary["no_snapshot_blob"] or summary["rollback_failed"] or summary["error"]:
+        # Loud, config-independent surfacing of a non-recoverable / failed orphan.
+        import sys as _sys
+        _sys.stderr.write(
+            "[startup-reconcile] ATTENTION — orphaned merge(s) need human review: "
+            f"no_snapshot_blob={summary['no_snapshot_blob']} "
+            f"rollback_failed={summary['rollback_failed']} error={summary['error']}\n")
+    _startup_reconcile = summary
+    return summary
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -843,6 +879,33 @@ def rollback_merge(snapshot_id: str) -> str:
     observed = _eng_build(reader, snap.master_key, list(snap.secondary_keys))
     rb = _eng_rollback(snap, observed, zot.gateway, library_id=zot.library_id)
     return json.dumps({"state": rb.state, "ok": rb.ok, "operations": rb.operations, "failures": rb.failures})
+
+
+@mcp.tool()
+def reconcile_orphans() -> str:
+    """F4 crash-recovery on demand: find every orphaned `commit_merge_intent` (a live merge that crashed
+    mid-trash — intent logged, no result) and roll it back from its snapshot (un-trash secondaries +
+    revert master + reparent children — the sanctioned rollback path, never purge). This ALSO runs once
+    automatically at server startup. Returns structured counts; any orphan whose snapshot blob is MISSING
+    is reported LOUDLY under `no_snapshot_blob` with an `alert` (non-recoverable — needs human recovery),
+    never a silent skip."""
+    zot = get_client()
+    reader = WebClusterReader(zot, zot.library_id)
+    outcomes = _eng_reconcile(zot.prov, reader, zot.gateway, library_id=zot.library_id)
+    no_blob = [o.get("snapshot_id") for o in outcomes if o.get("status") == "no-snapshot-blob"]
+    failed = [o.get("snapshot_id") for o in outcomes if o.get("status") == "rollback_failed"]
+    alert = None
+    if no_blob or failed:
+        alert = (f"{len(no_blob)} orphan(s) have NO snapshot blob (non-recoverable) and "
+                 f"{len(failed)} rollback(s) failed — HUMAN REVIEW required")
+    return json.dumps({
+        "orphans_found": len(outcomes),
+        "reconciled": sum(1 for o in outcomes if o.get("status") == "reconciled"),
+        "rollback_failed": failed,
+        "no_snapshot_blob": no_blob,
+        "alert": alert,
+        "outcomes": [{"snapshot_id": o.get("snapshot_id"), "status": o.get("status")} for o in outcomes],
+    })
 
 
 @mcp.tool()

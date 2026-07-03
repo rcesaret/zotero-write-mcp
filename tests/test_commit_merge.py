@@ -382,3 +382,20 @@ def test_f4_reconcile_orphan_rolls_back(tmp_path, monkeypatch):
     assert outcomes and outcomes[0]["status"] == "reconciled"
     assert lib.items["M2"]["data"].get("deleted") in (None, 0)    # M2 un-trashed by the reconcile rollback
     assert not find_orphan_commit_intents(prov)                   # resolved (commit_merge_reconciled recorded)
+
+
+def test_f4_reconcile_no_snapshot_blob_is_loud_not_silent(tmp_path):
+    """C.2 (REV5 finding 3): an orphaned commit_merge_intent whose snapshot blob is MISSING must report
+    `no-snapshot-blob` (non-recoverable, surfaced) — NOT a silent skip that hides an unrecoverable
+    half-merge. No gateway write is attempted for such an orphan (reconcile bails before rollback)."""
+    from zotero_write_mcp.merge_live import reconcile_orphan_commits, find_orphan_commit_intents
+    lib = FakeLibrary(make_raw())
+    prov = ProvenanceStore(tmp_path / "prov")
+    # An intent whose snapshot_id was NEVER snapshot_cluster'd -> there is no before-blob to roll back from.
+    prov.record(activity="commit_merge_intent", item_key="M1", snapshot_id="GHOST-SID",
+                params={"secondaries": ["M2"]})
+    assert find_orphan_commit_intents(prov)
+    outcomes = reconcile_orphan_commits(prov, lib, lib, library_id=11056739)
+    assert outcomes and outcomes[0]["status"] == "no-snapshot-blob"
+    assert outcomes[0]["snapshot_id"] == "GHOST-SID"
+    assert lib.items["M2"]["data"].get("deleted") in (None, 0)    # untouched — no blind write on a blobless orphan
