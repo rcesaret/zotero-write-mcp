@@ -21,7 +21,8 @@ from zotero_write_mcp import __version__
 from zotero_write_mcp.gateway import ConcurrencyConflictError, library_prefix
 from zotero_write_mcp.merge import (
     ClusterSnapshot, RestoreReport, build_cluster, cluster_snapshot_from_dict, compute_merge_projection,
-    rollback_merge, verify_merge, _as_list, _is_empty, _is_trashed, _master_overrides, _unwrap, _zotero_tags,
+    rollback_merge, verify_merge, _as_list, _citekey_from_extra, _is_empty, _is_trashed, _master_overrides,
+    _unwrap, _zotero_tags,
 )
 from zotero_write_mcp.observability import observability_is_fresh
 from zotero_write_mcp.provenance import ProvenanceStore
@@ -486,7 +487,15 @@ class WebClusterReader:
         return [c for c in children if c.get("data", {}).get("itemType") == "annotation"]
 
     def get_citekey(self, key: str) -> Optional[str]:
-        return None   # BBT JSON-RPC citekey lookup — TODO; None is safe for check #11 (preserve-unchanged)
+        """The item's Better BibTeX citation key, read from the Web API item DATA (no BBT JSON-RPC):
+        the PINNED key from the ``extra`` ``Citation Key:`` line when present, else the ``citationKey``
+        field. Empirically (S0 web-API survey, library 11056739) ``citationKey`` is present on the Web
+        API for 100% of items and a pinned ``extra`` line for ~27%; the 11-check verify runs pre-trash,
+        so the computed key cannot drift within the merge window. ``None`` only when neither source is
+        present — an honestly keyless item is ``None==None`` under check #11 (correct preserve-unchanged),
+        never a fabricated key."""
+        data = self.get_item(key).get("data", {}) or {}
+        return _citekey_from_extra(data.get("extra")) or data.get("citationKey") or None
 
 
 def load_snapshot(prov: ProvenanceStore, snapshot_id: str) -> Optional[ClusterSnapshot]:

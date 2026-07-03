@@ -330,6 +330,19 @@ def _tex_ids_of(extra_text: Optional[str]) -> list:
     return out
 
 
+def _citekey_from_extra(extra_text: Optional[str]) -> Optional[str]:
+    """The Better BibTeX **pinned** citation key declared in an item's ``extra`` via a ``Citation Key:``
+    line — BBT's mechanism for a manually pinned key, which (unlike the computed key) is stored in
+    ``extra`` and therefore syncs to the Web API. Mirrors :func:`_tex_ids_of`'s line-parse. ``None`` when
+    no such line is present (an unpinned item's key is computed, not stored here)."""
+    for ln in str(extra_text or "").splitlines():
+        if ln.strip().lower().startswith("citation key:"):
+            val = ln.split(":", 1)[1].strip()
+            if val:
+                return val
+    return None
+
+
 def _alias_extra(snapshot: ClusterSnapshot, base_extra: Optional[str] = None) -> Optional[str]:
     """The survivor's ``extra`` with the trashed duplicates' BBT citekeys accumulated as ``tex.ids`` aliases
     (so a manuscript citing a duplicate's ``@citekey`` still resolves post-merge). Accumulates, per secondary,
