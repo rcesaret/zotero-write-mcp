@@ -75,3 +75,62 @@ def test_reconcile_orphans_tool_surfaces_no_snapshot_blob(monkeypatch):
     assert out["orphans_found"] == 1
     assert out["no_snapshot_blob"] == ["GHOST"]
     assert out["alert"] and "human review" in out["alert"].lower()
+
+
+# ── C.4: field_sources + expected_master_version wired onto merge_cluster / commit_merge tools ─────
+
+def _stub_client(monkeypatch, lib_id=9):
+    """Stub out the live client + reader + snapshot load + startup reconcile so a merge tool runs
+    offline against a monkeypatched engine fn (no network, no library)."""
+
+    class _FakeClient:
+        prov = "PROV"
+        gateway = "GW"
+        library_id = lib_id
+
+    monkeypatch.setattr(server, "ZoteroClient", lambda: _FakeClient())
+    monkeypatch.setattr(server, "WebClusterReader", lambda c, lib: "READER")
+    monkeypatch.setattr(server, "_eng_load_snapshot", lambda prov, sid: object())   # non-None snapshot
+    monkeypatch.setattr(server, "_eng_reconcile", lambda *a, **k: [])               # startup no-op
+    monkeypatch.setattr(server, "_client", None)
+
+
+def test_merge_cluster_threads_field_sources(monkeypatch):
+    captured = {}
+
+    class _Plan:
+        drifted, drift_keys, patches, master_version = False, [], [], 77
+
+    _stub_client(monkeypatch)
+    monkeypatch.setattr(server, "_eng_merge", lambda *a, **k: (captured.update(k) or _Plan()))
+    out = json.loads(_tool_fn("merge_cluster")("M", ["S"], "SID", smart_fill=True,
+                                               field_sources={"title": "S"}))
+    assert captured["field_sources"] == {"title": "S"}
+    assert captured["smart_fill"] is True
+    assert out["master_version"] == 77          # the version to feed commit_merge's expected_master_version
+
+
+def test_commit_merge_threads_field_sources_and_expected_version(monkeypatch):
+    captured = {}
+
+    class _Res:
+        mode, reason, verify_passed, trashed, rollback = "shadow", "", True, [], None
+
+    _stub_client(monkeypatch)
+    monkeypatch.setattr(server, "_eng_commit", lambda *a, **k: (captured.update(k) or _Res()))
+    _tool_fn("commit_merge")("M", "SID", field_sources={"date": "S"}, expected_master_version=77)
+    assert captured["field_sources"] == {"date": "S"}
+    assert captured["expected_master_version"] == 77
+
+
+def test_commit_merge_param_defaults_unchanged(monkeypatch):
+    captured = {}
+
+    class _Res:
+        mode, reason, verify_passed, trashed, rollback = "shadow", "", True, [], None
+
+    _stub_client(monkeypatch)
+    monkeypatch.setattr(server, "_eng_commit", lambda *a, **k: (captured.update(k) or _Res()))
+    _tool_fn("commit_merge")("M", "SID")
+    assert captured["field_sources"] is None
+    assert captured["expected_master_version"] is None

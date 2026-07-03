@@ -837,31 +837,47 @@ def snapshot_cluster(master_key: str, dup_keys: list) -> str:
 
 
 @mcp.tool()
-def merge_cluster(master_key: str, dup_keys: list, snapshot_id: str, smart_fill: bool = False) -> str:
+def merge_cluster(master_key: str, dup_keys: list, snapshot_id: str, smart_fill: bool = False,
+                  field_sources: Optional[dict] = None) -> str:
     """PATCH phase of a merge: reparent children to the master + union collections/tags/relations +
-    dc:replaces. NO delete — reversible via rollback_merge. Aborts with NO writes on version drift."""
+    dc:replaces. NO delete — reversible via rollback_merge. Aborts with NO writes on version drift.
+
+    `field_sources` ({field: source_member_key}) is the owner-approved Phase-B field-level enrichment,
+    applied verbatim from the named member and enforced by verify check #3 (a wrong value fails the gate,
+    not the library). The returned `master_version` is the POST-PATCH master version — pass it into
+    commit_merge's `expected_master_version` to pin the master across the merge_cluster→commit window."""
     zot = get_client()
     snap = _eng_load_snapshot(zot.prov, snapshot_id)
     if snap is None:
         return json.dumps({"error": f"unknown snapshot_id {snapshot_id}; call snapshot_cluster first"})
     reader = WebClusterReader(zot, zot.library_id)
-    plan = _eng_merge(snap, reader, zot.gateway, library_id=zot.library_id, smart_fill=smart_fill)
+    plan = _eng_merge(snap, reader, zot.gateway, library_id=zot.library_id, smart_fill=smart_fill,
+                      field_sources=field_sources)
     return json.dumps({"drifted": plan.drifted, "drift_keys": plan.drift_keys,
                        "patches": plan.patches, "master_version": plan.master_version})
 
 
 @mcp.tool()
-def commit_merge(master_key: str, snapshot_id: str, smart_fill: bool = False) -> str:
+def commit_merge(master_key: str, snapshot_id: str, smart_fill: bool = False,
+                 field_sources: Optional[dict] = None, expected_master_version: Optional[int] = None) -> str:
     """Verify-gated commit: re-run the 11-check verify against the live post-PATCH state, then TRASH the
     secondaries (PATCH deleted:1, NEVER purge). SHADOW by default — it only trashes when the out-of-band
     env token ZOT_MERGE_LIVE_ENABLED is set AND observability is fresh AND the ceiling/disjointness gates
-    hold. Any post-verify failure routes to rollback_merge."""
+    hold. Any post-verify failure routes to rollback_merge.
+
+    `field_sources` MUST match the merge_cluster call (verify check #3 enforces the projected survivor).
+    `expected_master_version` = the `master_version` merge_cluster returned; if the live master has
+    advanced past it (a concurrent edit landed in the merge_cluster→commit window) the commit fails closed
+    and rolls back rather than trashing on top of someone else's edit (review #7 concurrency pin). When
+    omitted (None) the pin is skipped — the Python live-apply driver passes it; the agent surface should
+    thread merge_cluster's returned master_version straight through."""
     zot = get_client()
     snap = _eng_load_snapshot(zot.prov, snapshot_id)
     if snap is None:
         return json.dumps({"error": f"unknown snapshot_id {snapshot_id}"})
     reader = WebClusterReader(zot, zot.library_id)
-    res = _eng_commit(snap, reader, zot.gateway, zot.prov, library_id=zot.library_id, smart_fill=smart_fill)
+    res = _eng_commit(snap, reader, zot.gateway, zot.prov, library_id=zot.library_id, smart_fill=smart_fill,
+                      field_sources=field_sources, expected_master_version=expected_master_version)
     return json.dumps({"mode": res.mode, "reason": res.reason, "verify_passed": res.verify_passed,
                        "trashed": res.trashed,
                        "rollback_ok": (res.rollback.ok if res.rollback else None)})
