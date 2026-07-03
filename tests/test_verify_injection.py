@@ -362,3 +362,43 @@ def test_hole3_master_version_drift_unchecked(snap):
     assert r.passed is False, (
         "RESIDUAL: master version drift is intentionally not a structural-gate concern"
     )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  PART 4 — SYMMETRIC #3 / #6 (S0 C.3): reject DEVIANT ADDED fields / relations
+#  (REV1 M-HIGH-1 & M-HIGH-3 — seeds for the 2nd Stage-E adversarial pass)
+# ════════════════════════════════════════════════════════════════════════════════
+
+def test_c3_added_master_field_caught_by_symmetric_3(snap):
+    """REV1 M-HIGH-1: a value ADDED to a snapshot-EMPTY master slot (a concurrent edit or a rogue
+    smart_fill) must be rejected by the now-symmetric #3. The old presence-only check iterated only the
+    EXPECTED fields and skipped empty slots, so it passed this clean."""
+    p = project(snap)
+    p.items[MASTER].fields["publisher"] = "Rogue Press"        # no cluster member carried a publisher
+    r = verify_merge(snap, p)
+    assert r.passed is False and "master-scalar-preservation" in names(r)
+
+
+def test_c3_added_master_relation_caught_by_symmetric_6(snap):
+    """REV1 M-HIGH-3: a deviant ADDED relation — dc:replaces to a VICTIM outside the cluster plus an
+    injected owl:sameAs predicate no member had — must be rejected by the now-symmetric #6 upper bound.
+    The old superset-only check saw only drops, so both additions were invisible."""
+    p = project(snap)
+    dc = list(p.items[MASTER].relations.get("dc:replaces", []))
+    dc.append(f"{LIBRARY_BASE}/VICTIM99")                      # a bystander, not one of this cluster's secondaries
+    p.items[MASTER].relations["dc:replaces"] = dc
+    p.items[MASTER].relations["owl:sameAs"] = [f"{LIBRARY_BASE}/INJECTED"]   # predicate no member had
+    r = verify_merge(snap, p)
+    assert r.passed is False and "relations-superset" in names(r)
+
+
+def test_c3_legit_enriched_merge_still_passes_3_and_6(snap):
+    """G2 no-false-positive guard: a legitimate owner-approved enrichment (field_sources) that changes a
+    master field to a chosen secondary's value must PASS #3 and #6. The SAME title change FAILS #3
+    without field_sources (test_inv03) — the gate enforces exactly the approved projection, no more."""
+    fs = {"title": SEC1}
+    p = copy.deepcopy(compute_merge_projection(snap, library_base=LIBRARY_BASE, field_sources=fs))
+    r = verify_merge(snap, p, field_sources=fs)
+    assert r.passed, r.to_dict()
+    assert "master-scalar-preservation" not in names(r)
+    assert "relations-superset" not in names(r)

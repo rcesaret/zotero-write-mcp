@@ -419,20 +419,35 @@ def verify_merge(
              if observed.items.get(k) is None or observed.items[k].version != snapshot.items[k].version]
     add(2, "version-drift", not drift, f"secondaries with version drift={drift}")
 
-    # 3 — master scalar-field preservation / approved enrichment: each non-empty EXPECTED master scalar
-    #     (incl. creators) is byte-identical in observed. EXPECTED = the snapshot master's fields overlaid
-    #     with the Phase-B owner-approved enrichment (field <- its chosen source member's value). With no
-    #     field_sources this is pure survivor preservation; with them, a field NOT enriched to EXACTLY the
-    #     approved value — or changed to anything else — is caught: obs.get(k) -> None/other != v.
+    # 3 — master scalar-field preservation / approved enrichment, SYMMETRIC (REV1 M-HIGH-1): each
+    #     non-empty EXPECTED master scalar (incl. creators) is byte-identical in observed (lower bound),
+    #     AND observed introduces NO value the projection does not expect (upper bound — a deviant field
+    #     ADDED to a snapshot-EMPTY slot by a concurrent edit or a rogue smart_fill is rejected; the old
+    #     presence-only check skipped empty slots). EXPECTED = the snapshot master's fields, overlaid with
+    #     (smart_fill) master-empty fields filled from a secondary and (Phase B) the owner-approved
+    #     enrichment — recomputed independently from the snapshot (mirrors compute_merge_projection's
+    #     field logic and the collections `==` upper bound), never trusting observed.
     overrides = _master_overrides(snapshot, field_sources)
-    expected_fields = {**sm.fields, **overrides}
-    changed = []
+    expected_fields = dict(sm.fields)
+    if smart_fill:
+        for _sk in sec_keys:
+            for _fk, _fv in snapshot.items[_sk].fields.items():
+                if _fk not in _PROTECTED_FIELDS and _is_empty(expected_fields.get(_fk)) and not _is_empty(_fv):
+                    expected_fields[_fk] = _fv
+    expected_fields.update(overrides)
+    changed, added = [], []
     for k, v in expected_fields.items():
-        if _is_empty(v) and k not in overrides:        # skip empty survivor-own fields, but ALWAYS assert an override (review #1)
+        if _is_empty(v) and k not in overrides:        # expected-empty, non-override survivor slot...
+            if not _is_empty(obs_m.fields.get(k)):     # ...must STAY empty; a value here is a deviant add
+                added.append(k)
             continue
         if obs_m.fields.get(k) != v:
             changed.append(k)
-    add(3, "master-scalar-preservation", not changed, f"master fields != approved survivor={changed}")
+    for k, v in obs_m.fields.items():                  # a key present in observed but not in the projection
+        if k not in expected_fields and not _is_empty(v):
+            added.append(k)
+    add(3, "master-scalar-preservation", not changed and not added,
+        f"master fields deviate from approved survivor: changed={changed}; added={sorted(set(added))}")
 
     # 4 — collections EQUALITY vs independently-recomputed union (==, not superset)
     expected_cols = set()
@@ -458,7 +473,11 @@ def verify_merge(
     add(5, "tags-tuple-superset", not lost_tags and not flipped_tags,
         f"lost={sorted(lost_tags)}; type-flips={sorted(flipped_tags)}")
 
-    # 6 — relations superset (full dict) incl. dc:replaces → each secondary
+    # 6 — relations superset (full dict) incl. dc:replaces → each secondary, SYMMETRIC (REV1 M-HIGH-3):
+    #     observed ⊇ the independently-recomputed union (lower bound) AND observed ⊆ that union plus the
+    #     cluster's own dc:replaces→secondaries (upper bound — a deviant ADDED relation, e.g. a dc:replaces
+    #     to a victim OUTSIDE the cluster or an injected owl:sameAs, is rejected, symmetric to the
+    #     collections `==` check). dc:replaces is compared by EXACT target KEY (library-base-agnostic).
     expected_rel: dict = {}
     for it in cluster_items:
         for pred, vals in it.relations.items():
@@ -469,8 +488,22 @@ def verify_merge(
             rel_missing.append(pred)
     dc_target_keys = {_rel_target_key(x) for x in _as_list(obs_m.relations.get("dc:replaces"))}
     dc_missing = [k for k in sec_keys if k not in dc_target_keys]   # EXACT key membership, not substring
-    add(6, "relations-superset", not rel_missing and not dc_missing,
-        f"missing predicates={rel_missing}; dc:replaces missing secondaries={dc_missing}")
+    # Upper bound: reject any observed relation the merge should NOT have introduced. Allowed dc:replaces
+    # targets (by key) = any pre-existing (from a member) + this cluster's secondaries; every other
+    # predicate's observed targets must be a subset of the recomputed union.
+    allowed_dc_keys = {_rel_target_key(x) for x in expected_rel.get("dc:replaces", set())} | set(sec_keys)
+    rel_extra = []
+    for pred, vals in obs_m.relations.items():
+        obs_vals = set(_as_list(vals))
+        if pred == "dc:replaces":
+            deviant = sorted(x for x in obs_vals if _rel_target_key(x) not in allowed_dc_keys)
+        else:
+            deviant = sorted(obs_vals - expected_rel.get(pred, set()))
+        if deviant:
+            rel_extra.append((pred, deviant))
+    add(6, "relations-superset", not rel_missing and not dc_missing and not rel_extra,
+        f"missing predicates={rel_missing}; dc:replaces missing secondaries={dc_missing}; "
+        f"deviant-added={rel_extra}")
 
     # 7 — child completeness by presence: every snapshot child live & parented to master
     obs_parent = {n.key: n.parent_key for n in observed.notes}
