@@ -160,3 +160,103 @@ def test_create_linked_file_attachment_raises_at_client():
     from zotero_write_mcp.client import ZoteroClient
     with _pytest.raises(RuntimeError, match="DISABLED"):
         ZoteroClient.create_linked_file_attachment(object(), "P", "f.pdf", "t", "application/pdf")
+
+
+# ── S3: validate_record — read-only, zero Zotero writes, logs a read-only PROV record ─────────────
+
+class _FakeProv:
+    """Captures every .record() call; exposes NO write-shaped method at all — if validate_record ever
+    tried to create/update/delete an item through this fake it would AttributeError, not silently
+    succeed, which is exactly the assertion we want for 'validate_record makes zero Zotero writes'."""
+
+    def __init__(self):
+        self.calls = []
+
+    def record(self, **kw):
+        self.calls.append(kw)
+        return kw
+
+
+class _FakeGathered:
+    def __init__(self, records, evidence=None, available=None, answered=None):
+        self.records = records
+        self.evidence = evidence or []
+        self.available = available or []
+        self.answered = answered or []
+
+
+def _stub_validate_client(monkeypatch, prov):
+    class _FakeClient:
+        def __init__(self):
+            self.prov = prov
+    monkeypatch.setattr(server, "ZoteroClient", _FakeClient)
+    monkeypatch.setattr(server, "_client", None)
+    monkeypatch.setattr(server, "_eng_reconcile", lambda *a, **k: [])   # startup no-op
+
+
+def test_validate_record_registered():
+    assert hasattr(server, "validate_record")
+
+
+def test_validate_record_is_pure_read_makes_zero_zotero_writes(monkeypatch):
+    """The FakeClient/FakeProv carry NO create/update/delete method — calling validate_record must
+    never attempt one (would AttributeError, which we'd see as a test failure, not a silent write)."""
+    prov = _FakeProv()
+    _stub_validate_client(monkeypatch, prov)
+    monkeypatch.setattr(server._eng_sources, "default_authorities", lambda: [])
+    monkeypatch.setattr(server._eng_sources, "gather_by_search",
+                        lambda record, authorities: _FakeGathered([]))
+    monkeypatch.setattr(server._eng_validation, "load_calibration",
+                        lambda: server._eng_validation.DEFAULT_CALIBRATION)
+
+    out = json.loads(_tool_fn("validate_record")(
+        item_type="journalArticle", title="Some Title",
+        creators=[{"creatorType": "author", "lastName": "Smith"}], date="2020",
+    ))
+    assert set(out.keys()) >= {"p", "decision", "evidence", "conflicts"}
+    assert out["decision"] in ("accept", "flag", "reject")
+
+
+def test_validate_record_logs_exactly_one_readonly_prov_informed_by(monkeypatch):
+    prov = _FakeProv()
+    _stub_validate_client(monkeypatch, prov)
+    monkeypatch.setattr(server._eng_sources, "default_authorities", lambda: [])
+    monkeypatch.setattr(server._eng_sources, "gather_by_doi",
+                        lambda doi, authorities: _FakeGathered(
+                            [{"source": "crossref", "title": "Some Title", "date": "2020",
+                              "creators": [{"lastName": "Smith"}], "doi": "10.1/x"}],
+                            evidence=["crossref: ok"], available=["crossref"], answered=["crossref"]))
+    monkeypatch.setattr(server._eng_validation, "load_calibration",
+                        lambda: server._eng_validation.DEFAULT_CALIBRATION)
+
+    _tool_fn("validate_record")(
+        item_type="journalArticle", title="Some Title",
+        creators=[{"creatorType": "author", "lastName": "Smith"}], date="2020", doi="10.1/x",
+    )
+    assert len(prov.calls) == 1
+    rec = prov.calls[0]
+    assert rec["activity"] == "validate_record"
+    # A read-only "informed-by" record: before/after are never passed, so this is unambiguously NOT
+    # a mutation entry (json_sha256 on both stays null in the real ProvenanceStore).
+    assert "before" not in rec and "after" not in rec
+    assert "identity_sha256" in rec["params"]
+    assert rec["params"]["decision"] in ("accept", "flag", "reject")
+
+
+def test_validate_record_degrades_cleanly_with_no_authorities_available(monkeypatch):
+    """Every authority unavailable (e.g. no OPENALEX_API_KEY, DNS down, ...) -> never crashes, never
+    auto-accepts, routes to flag with an honest evidence trail (PLAN1 SS4 degraded path)."""
+    prov = _FakeProv()
+    _stub_validate_client(monkeypatch, prov)
+    monkeypatch.setattr(server._eng_sources, "default_authorities", lambda: [])
+    monkeypatch.setattr(server._eng_sources, "gather_by_search",
+                        lambda record, authorities: _FakeGathered(
+                            [], evidence=["openalex: unavailable (no key)", "crossref: 0 candidate(s)"]))
+    monkeypatch.setattr(server._eng_validation, "load_calibration",
+                        lambda: server._eng_validation.DEFAULT_CALIBRATION)
+
+    out = json.loads(_tool_fn("validate_record")(
+        item_type="journalArticle", title="Obscure Paper With No Hits", creators=[], date="2020",
+    ))
+    assert out["decision"] != "accept"
+    assert any("unavailable" in e for e in out["evidence"])

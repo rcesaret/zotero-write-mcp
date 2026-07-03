@@ -35,3 +35,8 @@ exit-gate-runs/
 
 # Phase-3 validation source-client cache (content-addressed, machine-local runtime state)
 runtime/validation-cache/
+
+# Phase-3 machine-local calibration override (e.g. an in-progress S3-cal fit not yet reviewed for
+# commit). The pinned runtime/validation-calibration.json IS committed -- this is only for a
+# not-yet-official local variant a session might write while iterating on a Platt refit.
+runtime/validation-calibration.local.json

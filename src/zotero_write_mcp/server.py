@@ -26,6 +26,12 @@ from zotero_write_mcp.merge_live import (
 )
 from zotero_write_mcp.dedup import dedup_scan as _eng_dedup
 from zotero_write_mcp.observability import query_provenance as _eng_query_prov, daily_report as _eng_daily
+# Phase-3 validation (sprint S3): read-only source clients + the pure scorer/gate. validate_record
+# below makes ZERO Zotero writes (INV-COMP) -- it only reads external authorities + logs a read-only
+# PROV "informed-by" record.
+from zotero_write_mcp import sources as _eng_sources
+from zotero_write_mcp import validation as _eng_validation
+from zotero_write_mcp import __version__ as _ENGINE_VERSION
 
 mcp = FastMCP(
     "ZoteroWrite",
@@ -112,6 +118,7 @@ def create_item(
     extra_fields: Optional[dict] = None,
     tags: Optional[list[str]] = None,
     check_duplicates: bool = True,
+    approval_token: str = "",
 ) -> str:
     """Create a new Zotero item from explicit metadata fields.
 
@@ -138,6 +145,11 @@ def create_item(
         extra_fields: Additional Zotero fields as key-value pairs
         tags: List of tag strings to apply
         check_duplicates: If True, check for duplicates before creating (default True)
+        approval_token: Out-of-band HMAC approval token (sprint S3, `scripts/approve_record.py`) for
+            the validation-gate PreToolUse hook. This function does NOT itself validate the token —
+            the hook re-derives and checks it BEFORE this call ever executes; it is accepted here
+            purely so it is visible in the tool call for the hook to inspect. Omit it when an accept
+            decision from `validate_record` is already on file for this exact record.
     """
     zot = get_client()
 
@@ -476,6 +488,77 @@ def validate_item(
             lines.append(f"  ⚠️ {w}")
 
     return "\n".join(lines)
+
+
+@mcp.tool()
+def validate_record(
+    item_type: str,
+    title: str,
+    creators: list[dict],
+    date: str = "",
+    doi: str = "",
+    publication_title: str = "",
+    book_title: str = "",
+) -> str:
+    """Phase-3 validation (sprint S3) — READ-ONLY. Gathers agreement from external bibliographic
+    authorities (DOI content-negotiation, Crossref, OpenAlex if keyed, Semantic Scholar, DataCite) for
+    a CANDIDATE record and returns a calibrated `{p, decision, evidence, conflicts}` verdict via the
+    PINNED 3-way gate (accept/flag/reject). Makes ZERO Zotero writes and zero library mutations of any
+    kind (INV-COMP, ADR-005) — it only reads external authorities + logs a read-only PROV
+    "informed-by" record. Confidence is cross-source agreement, NEVER an LLM self-report: nothing here
+    reads a caller-supplied confidence/probability field.
+
+    Degrades cleanly when a source is unavailable (e.g. no OPENALEX_API_KEY): composes over whatever
+    authorities ARE available, surfaces an `"<authority>: unavailable ..."` evidence note, and never
+    auto-accepts on fewer than the required authorities (PLAN1 SS4).
+
+    Args:
+        item_type: Zotero item type of the CANDIDATE record being validated (journalArticle, book, ...)
+        title: Candidate title
+        creators: List of creator dicts, each with 'creatorType', 'firstName', 'lastName'
+        date: Candidate publication date/year
+        doi: Candidate DOI, if known (drives a direct doi-lookup path over search)
+        publication_title: Candidate journal/venue name (for journalArticle-shaped records)
+        book_title: Candidate book title (for bookSection-shaped records; used as the venue field)
+    """
+    candidate = {
+        "itemType": item_type, "title": title, "creators": creators or [], "date": date,
+        "DOI": doi, "publicationTitle": publication_title, "bookTitle": book_title,
+    }
+
+    authorities = _eng_sources.default_authorities()
+    doi_lookup_attempted = bool(doi)
+    if doi:
+        gathered = _eng_sources.gather_by_doi(doi, authorities)
+    else:
+        gathered = _eng_sources.gather_by_search(candidate, authorities)
+
+    calibration = _eng_validation.load_calibration()
+    verdict = _eng_validation.build_validation_result(
+        candidate, gathered.records, calibration,
+        doi_lookup_attempted=doi_lookup_attempted, extra_evidence=gathered.evidence,
+    )
+    verdict["available_authorities"] = gathered.available
+    verdict["answered_authorities"] = gathered.answered
+
+    # Read-only PROV "informed-by" record: a validation CONSULTED authorities; it is NOT a mutation.
+    # before/after are intentionally omitted (both json_sha256 stay null) so this record is
+    # unambiguously distinct from every create/update/merge PROV entry in the same log.
+    zot = get_client()
+    zot.prov.record(
+        activity="validate_record",
+        agent="validation-engine", tool_version=_ENGINE_VERSION,
+        params={
+            "identity_sha256": _eng_validation.identity_sha256(candidate),
+            "decision": verdict["decision"],
+            "p": verdict["p"],
+            "available_authorities": gathered.available,
+            "answered_authorities": gathered.answered,
+        },
+        source="; ".join(gathered.evidence) or None,
+        confidence=verdict["p"],
+    )
+    return json.dumps(verdict)
 
 
 @mcp.tool()

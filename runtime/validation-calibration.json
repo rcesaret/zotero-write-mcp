@@ -1,0 +1,14 @@
+{
+  "calibration_version": "cold-start-v1",
+  "n_labeled": 0,
+  "fit_date": null,
+  "accept_band_precision": null,
+  "method": "conservative-floor",
+  "platt": {
+    "A": 1.0,
+    "B": -6.0
+  },
+  "consensus_floor": 0.92,
+  "consensus_min_p_raw": 0.5,
+  "notes": "Cold-start conservative floor (sprint S3; no owner labels yet -- the Platt fit on ~200-500 hand-labeled records is sprint S3-cal, NOT this one). Platt(A=1.0,B=-6.0) alone maps even a perfect field match (p_raw=1.0) to sigmoid(1.0-6.0)~=0.0067 -- far below the 0.90 accept floor, so single-authority id_agreement NEVER reaches accept at cold start. Only when >=2 authorities independently corroborate the SAME DOI (consensus=True) AND field agreement is at least middling (p_raw>=consensus_min_p_raw=0.5) does calibrated p get floored up to consensus_floor=0.92 (just above the 0.90 gate). This makes the accept band effectively unreachable except on exact multi-authority DOI consensus (PLAN1 SS1.5), which is the deliberate cold-start safety posture: the validator flags almost everything until real labels widen the calibrated band in S3-cal. validate_record loads this file at call time via zotero_write_mcp.validation.load_calibration(); a missing/malformed file falls back in-code to the identical DEFAULT_CALIBRATION constant in validation.py -- never crashes, never silently widens the accept band."
+}
