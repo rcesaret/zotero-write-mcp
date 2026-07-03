@@ -514,6 +514,10 @@ def find_duplicate_candidates(
 ) -> str:
     """Scan the Zotero library for potential duplicate items using fuzzy matching.
 
+    ADVISORY ONLY (REV3 F4): these fuzzy scores feed the human-review queue; the deterministic
+    `dedup_scan` (exact DOI OR exact normalized title+year+first-author) is the SOLE auto-accept /
+    merge path. Never merge on this tool's output.
+
     Compares items by title, authors, date, and DOI. Returns pairs above the
     minimum similarity score. This can take time for large libraries.
 
@@ -574,6 +578,9 @@ def find_duplicates_for_item(
 ) -> str:
     """Find potential duplicates of a specific item in the library.
 
+    ADVISORY ONLY (REV3 F4): fuzzy scores for the human-review queue; the deterministic `dedup_scan` is
+    the SOLE auto-accept / merge path.
+
     Args:
         item_key: The item key to find duplicates of
         min_score: Minimum similarity score to report
@@ -620,6 +627,9 @@ def compare_items_for_merge(
     item_key_b: str,
 ) -> str:
     """Show a detailed side-by-side comparison of two items for merge decisions.
+
+    ADVISORY ONLY (REV3 F4): a human-review aid; the deterministic `dedup_scan` + the verify-gated merge
+    chain are the SOLE auto-accept / merge path.
 
     Displays all fields from both items, highlighting differences to help
     decide which fields to keep.
@@ -733,90 +743,9 @@ def merge_items(
         "  rollback_merge(snapshot_id) on failure.\n"
         "See memory/phase2-build-spec.md / .claude/rules/merge-safety.md."
     )
-
-    zot = get_client()
-
-    # Safety check
-    if requires_confirmation(RiskLevel.HIGH) and not confirm:
-        # Build preview
-        item_a = zot.get_item(primary_key)
-        item_b = zot.get_item(secondary_key)
-        data_a = item_a.get("data", item_a)
-        data_b = item_b.get("data", item_b)
-
-        lines = [
-            "## Merge Preview\n",
-            f"**Primary (keep):** {format_item_summary(item_a)}",
-            f"**Secondary (delete):** {format_item_summary(item_b)}",
-            "",
-        ]
-
-        if use_secondary_fields:
-            lines.append(f"**Fields taken from secondary:** {', '.join(use_secondary_fields)}")
-            for f in use_secondary_fields:
-                lines.append(f"  {f}: '{data_b.get(f, '')}' ← replaces '{data_a.get(f, '')}'")
-
-        if field_overrides:
-            lines.append(f"**Explicit overrides:** {json.dumps(field_overrides)}")
-
-        if merge_tags:
-            tags_a = {t.get("tag", "") for t in data_a.get("tags", [])}
-            tags_b = {t.get("tag", "") for t in data_b.get("tags", [])}
-            combined = tags_a | tags_b
-            lines.append(f"**Merged tags:** {', '.join(sorted(combined))}")
-
-        lines.append(
-            f"\n⚠️ **This will DELETE item {secondary_key}.** "
-            "Call again with `confirm=True` to execute."
-        )
-        return "\n".join(lines)
-
-    # Execute merge
-    item_a = zot.get_item_web(primary_key)  # web read for current version
-    item_b = zot.get_item_web(secondary_key)  # web read for current version
-    data_a = item_a.get("data", item_a)
-    data_b = item_b.get("data", item_b)
-    version_a = item_a.get("version", data_a.get("version"))
-    version_b = item_b.get("version", data_b.get("version"))
-
-    # Apply secondary fields
-    if use_secondary_fields:
-        for field in use_secondary_fields:
-            if field in data_b:
-                data_a[field] = data_b[field]
-
-    # Merge tags
-    if merge_tags:
-        tags_a = data_a.get("tags", [])
-        tags_b = data_b.get("tags", [])
-        existing_tags = {t["tag"] for t in tags_a}
-        for t in tags_b:
-            if t["tag"] not in existing_tags:
-                tags_a.append(t)
-        data_a["tags"] = tags_a
-
-    # Apply explicit overrides (highest priority)
-    if field_overrides:
-        for k, v in field_overrides.items():
-            data_a[k] = v
-
-    # Update primary
-    zot.update_item(primary_key, data_a, version_a)
-
-    # Delete secondary
-    try:
-        zot.delete_item(secondary_key, version_b)
-        return (
-            f"✅ Merge complete.\n"
-            f"**Kept:** {primary_key}\n"
-            f"**Deleted:** {secondary_key}"
-        )
-    except Exception as e:
-        return (
-            f"⚠️ Primary item {primary_key} updated, but failed to delete "
-            f"secondary {secondary_key}: {e}\n"
-            f"You may need to delete it manually."
-        )
+    # (S0 C.5 / REV3 F7) The old ungated update-primary + PURGE-delete-secondary body below the return was
+    # unreachable dead code that kept a destructive purge path one deleted `return` from resurrection and
+    # contradicted trash-not-purge. Deleted. The retirement stub above is the whole function now.
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1050,55 +979,19 @@ def attach_file_linked(
     file_path: str,
     title: Optional[str] = None,
 ) -> str:
-    """Attach a file to a Zotero item as a LINKED file (Zotero points to the file on disk).
+    """DISABLED (S0 C.5) — imported-only attachment policy (.claude/rules/file-handling.md).
 
-    The file stays where it is. Zotero stores only the path reference.
-    Best for: existing organized file collections you don't want duplicated.
-
-    Args:
-        item_key: The parent Zotero item key to attach the file to
-        file_path: Absolute path to the file on disk
-        title: Display title for the attachment (defaults to filename)
+    Linked-file attachments store only a local path: they work ONLY on the machine holding the file and
+    do NOT sync to cloud / groups / web / mobile. This tool now HARD-REFUSES at the engine so no caller
+    (raw MCP, stand-alone mode A, or a misconfigured host) can create a non-syncing linked attachment —
+    closing the bypass that the harness deny-list previously guarded only at the control-plane layer.
+    Use ``attach_file_imported`` instead (imported files sync and are accessible from any device).
     """
-    file_path = os.path.abspath(file_path)
-    if not os.path.isfile(file_path):
-        return f"❌ File not found: {file_path}"
-
-    zot = get_client()
-
-    # Check item exists
-    try:
-        item = zot.get_item(item_key)
-    except Exception as e:
-        return f"❌ Could not find item {item_key}: {e}"
-
-    # Check if already attached
-    children = zot.get_item_children_web(item_key)
-    for child in children:
-        child_data = child.get("data", child)
-        if child_data.get("path", "") == file_path:
-            return (
-                f"ℹ️ File already linked to {item_key}:\n"
-                f"  Path: {file_path}\n"
-                f"  Attachment key: {child.get('key', '?')}"
-            )
-
-    fname = title or Path(file_path).name
-    ctype = get_content_type(file_path)
-
-    result = zot.create_linked_file_attachment(item_key, file_path, fname, ctype)
-    success = result.get("success", {})
-    if success:
-        att_key = list(success.values())[0]
-        return (
-            f"✅ Linked file attachment created.\n"
-            f"  Parent: {item_key}\n"
-            f"  Attachment key: {att_key}\n"
-            f"  Path: {file_path}\n"
-            f"  Type: {ctype}"
-        )
-    else:
-        return f"❌ Failed to create attachment: {json.dumps(result)}"
+    return (
+        "attach_file_linked is DISABLED (imported-only policy — .claude/rules/file-handling.md). Linked "
+        "attachments do not sync (cloud/groups/web/mobile) and only work on the machine holding the file. "
+        "Use attach_file_imported instead."
+    )
 
 
 @mcp.tool()
@@ -1380,8 +1273,8 @@ def scan_directory_for_sources(
         lines.append(f"\n*Showing first 50 results. {len(files) - 50} more files not displayed.*")
 
     lines.append(
-        "\nUse `attach_file_linked` or `attach_file_imported` to attach files to items.\n"
-        "Use `bulk_link_files` to batch-attach confident matches."
+        "\nUse `attach_file_imported` to attach files to items (imported-only — linked attachments do "
+        "not sync). Use `bulk_link_files` to batch-attach confident matches (imported)."
     )
 
     return "\n".join(lines)
@@ -1390,10 +1283,10 @@ def scan_directory_for_sources(
 @mcp.tool()
 def bulk_link_files(
     mappings: list[dict],
-    mode: str = "linked",
+    mode: str = "imported",
     confirm: bool = False,
 ) -> str:
-    """Batch-attach multiple files to their matching Zotero items.
+    """Batch-attach multiple files to their matching Zotero items (IMPORTED-only).
 
     This is a bulk operation. By default returns a preview; set confirm=True to execute.
 
@@ -1402,14 +1295,19 @@ def bulk_link_files(
                   - 'file_path': absolute path to the file
                   - 'item_key': Zotero item key to attach to
                   - 'title' (optional): display title for the attachment
-        mode: "linked" (default) for linked files, "imported" for Zotero-managed copies
+        mode: "imported" (default AND the only accepted value) — Zotero-managed copies that sync to
+              cloud/groups/web/mobile. `mode="linked"` is REJECTED (S0 C.5, imported-only policy —
+              .claude/rules/file-handling.md); linked attachments do not sync and only work on the
+              machine holding the file. The safe choice is now the default (poka-yoke).
         confirm: Must be True to execute. False returns a preview.
     """
     if not mappings:
         return "❌ No mappings provided."
 
-    if mode not in ("linked", "imported"):
-        return f"❌ Invalid mode '{mode}'. Use 'linked' or 'imported'."
+    if mode != "imported":
+        return ("❌ Invalid mode '" + str(mode) + "'. Only 'imported' is allowed — linked attachments do "
+                "not sync (cloud/groups/web/mobile) and only work on the machine holding the file. See "
+                ".claude/rules/file-handling.md.")
 
     # Validate all files exist
     missing = []
@@ -1477,10 +1375,7 @@ def bulk_link_files(
                 results["skipped"] += 1
                 continue
 
-            if mode == "linked":
-                result = zot.create_linked_file_attachment(ik, fp, title, ctype)
-            else:
-                result = zot.create_imported_file_attachment(ik, fp, title, ctype)
+            result = zot.create_imported_file_attachment(ik, fp, title, ctype)   # imported-only (S0 C.5)
 
             if result.get("success"):
                 results["success"] += 1

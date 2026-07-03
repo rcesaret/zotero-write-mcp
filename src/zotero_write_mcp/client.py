@@ -289,29 +289,18 @@ class ZoteroClient:
     def create_linked_file_attachment(
         self, parent_key: str, file_path: str, title: str, content_type: str
     ) -> dict:
-        """Create a linked-file attachment pointing to a file on disk.
+        """DISABLED (S0 C.5) — imported-only attachment policy (.claude/rules/file-handling.md).
 
-        Note: linked_file attachments reference local paths. The web API
-        creates the metadata record; the local Zotero client resolves the path.
+        Linked-file attachments store only a local path: they work ONLY on the machine holding the file
+        and do NOT sync to cloud / groups / web / mobile. Hard-refused at the engine layer so no path —
+        raw MCP, stand-alone mode A, or a misconfigured host — can create a non-syncing linked attachment.
+        Use ``create_imported_file_attachment`` instead (imported files sync everywhere).
         """
-        attachment_data = {
-            "itemType": "attachment",
-            "parentItem": parent_key,
-            "linkMode": "linked_file",
-            "title": title,
-            "path": file_path,
-            "contentType": content_type,
-            "charset": "",
-            "tags": [],
-            "relations": {},
-        }
-        result = self.gateway.create_items(self.library_id, [attachment_data])
-        if result.item_keys:
-            self.prov.record(
-                activity="attach_file_linked", item_key=parent_key,
-                agent="zotero-write", tool_version=__version__,
-                params={"attachment_key": result.item_keys[0], "linkMode": "linked_file"})
-        return self._envelope_compat(result)
+        raise RuntimeError(
+            "create_linked_file_attachment is DISABLED — imported-only policy "
+            "(.claude/rules/file-handling.md). Linked attachments do not sync (cloud/groups/web/mobile). "
+            "Use create_imported_file_attachment instead."
+        )
 
     def create_imported_file_attachment(
         self, parent_key: str, file_path: str, title: str, content_type: str

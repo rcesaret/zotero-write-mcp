@@ -134,3 +134,29 @@ def test_commit_merge_param_defaults_unchanged(monkeypatch):
     _tool_fn("commit_merge")("M", "SID")
     assert captured["field_sources"] is None
     assert captured["expected_master_version"] is None
+
+
+# ── C.5: prune — linked-attach hard-refused at the engine; imported-only default ──────────────────
+
+def test_attach_file_linked_hard_refuses():
+    """S0 C.5: the linked-attach tool hard-refuses at the engine (imported-only, closes the raw-MCP
+    bypass) — the refusal returns BEFORE any get_client(), so no live client is needed."""
+    out = _tool_fn("attach_file_linked")("ITEM", "C:/does/not/matter.pdf")
+    assert "DISABLED" in out and "attach_file_imported" in out
+
+
+def test_bulk_link_files_rejects_linked_mode_and_defaults_imported():
+    """S0 C.5: bulk_link_files rejects mode='linked' and the default is now 'imported' (poka-yoke)."""
+    import inspect
+    out = _tool_fn("bulk_link_files")([{"file_path": "x", "item_key": "y"}], mode="linked")
+    assert "Only 'imported'" in out
+    assert inspect.signature(_tool_fn("bulk_link_files")).parameters["mode"].default == "imported"
+
+
+def test_create_linked_file_attachment_raises_at_client():
+    """S0 C.5: the deepest layer (client) hard-refuses too — a direct caller cannot create a linked
+    attachment via the ZoteroClient method."""
+    import pytest as _pytest
+    from zotero_write_mcp.client import ZoteroClient
+    with _pytest.raises(RuntimeError, match="DISABLED"):
+        ZoteroClient.create_linked_file_attachment(object(), "P", "f.pdf", "t", "application/pdf")
