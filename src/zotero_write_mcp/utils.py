@@ -1,4 +1,5 @@
 """Utilities for DOI resolution, BibTeX parsing, and fuzzy matching."""
+import os
 import re
 from difflib import SequenceMatcher
 from typing import Any, Optional
@@ -6,10 +7,23 @@ from typing import Any, Optional
 import httpx
 import bibtexparser
 
+from zotero_write_mcp import __version__
+
 
 # ── DOI Resolution via Crossref ──────────────────────────────────
 
 CROSSREF_URL = "https://api.crossref.org/works/{doi}"
+
+# Crossref's polite pool keys on a REAL mailto (the old placeholder got rate-limited). Read the contact
+# from the CROSSREF_MAILTO env var (default the owner's) and interpolate the real package __version__.
+CROSSREF_MAILTO_DEFAULT = "rcesaret@asu.edu"
+
+
+def _crossref_user_agent() -> str:
+    """The Crossref polite-pool User-Agent: real package version + a real mailto (CROSSREF_MAILTO env var,
+    default the owner's). Built per call so the env var is honored at runtime."""
+    mailto = os.environ.get("CROSSREF_MAILTO", CROSSREF_MAILTO_DEFAULT)
+    return f"ZoteroWriteMCP/{__version__} (mailto:{mailto})"
 
 
 def resolve_doi(doi: str) -> Optional[dict]:
@@ -18,7 +32,7 @@ def resolve_doi(doi: str) -> Optional[dict]:
     try:
         resp = httpx.get(
             CROSSREF_URL.format(doi=doi),
-            headers={"User-Agent": "ZoteroWriteMCP/0.1 (mailto:research@example.com)"},
+            headers={"User-Agent": _crossref_user_agent()},
             timeout=15.0,
         )
         resp.raise_for_status()
