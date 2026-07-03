@@ -25,7 +25,7 @@ def test_gated_merge_tools_registered():
 
 def test_merge_items_retired_refuses():
     """The legacy ungated merge tool refuses + redirects (its refusal returns before any get_client())."""
-    fn = _tool_fn("merge_items")
+    fn = getattr(server.merge_items, "fn", None) or server.merge_items
     out = fn("PRIMARY", "SECONDARY", confirm=True)
     assert "RETIRED" in out and "commit_merge" in out
 
