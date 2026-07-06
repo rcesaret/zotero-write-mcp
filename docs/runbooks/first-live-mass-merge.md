@@ -30,8 +30,10 @@ shadow driver `phase2_apply_reconciled.py`. It **never sets any token**; you set
       `citationKey` field — it does **not** `return None`. (Confirmed in the harness build-log, Session 16 /
       S0: `citationKey` present on 100 % of items by web-API survey, so #11 genuinely bites.) If it ever
       returns `None`, **STOP** — #11 would be inert and the merge unsafe.
-- [ ] **Engine suite green** at the S1 head: `uv run --with pytest python -m pytest` → **301 passed / 1
-      xfailed** (the 1 xfail = the documented master-version-drift residual).
+- [ ] **Engine suite green:** `uv run --with pytest python -m pytest` → **0 failed, exactly 1 xfailed**
+      (the documented master-version-drift residual). The *passed* count GROWS as later sprints land
+      (285 at S0 → 302 at S1 → 361 at S3 → more after S3-cal/S4), so verify **0 failures / 1 xfail** —
+      not a fixed number.
 - [ ] **Shadow run is 152/152 verify-clean:** `uv run python scripts/phase2_live_apply.py --shadow` →
       `152/152`, `0 failures`, `1 needs owner confirm` (the uncertain pair). This is a **read-only** dry run;
       run it now to confirm the current library state still projects clean.
