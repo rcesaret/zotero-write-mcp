@@ -57,6 +57,42 @@ def query_provenance(prov: ProvenanceStore, item_key: str) -> list:
 # by a future activity that happens to set params.pass.
 VERIFY_ACTIVITIES = frozenset({"shadow_merge", "commit_merge", "commit_merge_shadow", "commit_merge_verify"})
 
+# OBS-5 (S2 field finding, 2026-07-07; owner-approved): a human-reviewed verify failure is acknowledged by
+# appending this record (was_derived_from = the failed verify's snapshot_id). Because PROV is append-only,
+# a single caught failure would otherwise hold the all-time pass-rate below the 1.0 floor FOREVER and
+# deadlock every future live commit — the C-2 gate could never recover even after the incident was
+# investigated and fixed. Acknowledged failures are excluded from the health rate and reported separately
+# in `verify_failed_acknowledged` (visible, never hidden); UNacknowledged failures still degrade the report
+# and block live commits, fail-closed. The per-cluster 11-check verify gate is unaffected by this.
+ACK_ACTIVITY = "verify_failure_acknowledged"
+
+
+def _acknowledged_snapshot_ids(recs: list) -> set:
+    return {r.get("was_derived_from") for r in recs
+            if r.get("activity") == ACK_ACTIVITY and r.get("was_derived_from")}
+
+
+def acknowledge_verify_failure(prov: ProvenanceStore, snapshot_id: str, *, reason: str,
+                               acknowledged_by: str = "owner", ts: Optional[str] = None) -> dict:
+    """OBS-5: append the human-review acknowledgment for ONE failed verify, matched by snapshot_id.
+    Fail-closed validation: refuses (ValueError) unless a FAILED verify record with that snapshot_id
+    exists, refuses an empty reason, and is idempotent (a second acknowledgment of the same snapshot_id
+    is refused rather than double-recorded). The failed record itself is never altered (append-only)."""
+    if not (reason or "").strip():
+        raise ValueError("acknowledge_verify_failure: a non-empty reason is required")
+    recs = prov.all_records()
+    failed = [r for r in recs if r.get("activity") in VERIFY_ACTIVITIES and _has_pass(r)
+              and r["params"].get("pass") is False and r.get("was_derived_from") == snapshot_id]
+    if not failed:
+        raise ValueError(f"acknowledge_verify_failure: no FAILED verify record with "
+                         f"snapshot_id {snapshot_id!r} — nothing to acknowledge")
+    if snapshot_id in _acknowledged_snapshot_ids(recs):
+        raise ValueError(f"acknowledge_verify_failure: snapshot_id {snapshot_id!r} is already acknowledged")
+    return prov.record(
+        activity=ACK_ACTIVITY, agent=acknowledged_by, snapshot_id=snapshot_id, ts=ts,
+        params={"reason": reason, "acknowledged_by": acknowledged_by,
+                "failed_checks": (failed[0].get("params") or {}).get("failed")})
+
 
 def _has_pass(r: dict) -> bool:
     p = r.get("params")
@@ -68,14 +104,25 @@ def daily_report(prov: ProvenanceStore, *, sample_size: int = 10, ts: Optional[s
     """Compute the Phase-2 gate metrics from PROV and append a `daily_report` marker (the freshness +
     HEALTH artifact). The ONLY write is the marker append (no Zotero mutation).
 
-    `status` is **"degraded"** when the recent verify-pass-rate is below `pass_rate_floor` (default 1.0 —
+    `status` is **"degraded"** when the verify-pass-rate is below `pass_rate_floor` (default 1.0 —
     the Phase-2 exit gate demands 100% verify-pass), else "ok". `observability_is_fresh` rejects a non-ok
     marker, so a report that RUNS but records bad health blocks live commits (F3/C-2: the gate must detect a
-    SICK library, not only a DEAD report job). A `None` rate (no recent verifies) is "ok" — the per-commit
+    SICK library, not only a DEAD report job). A `None` rate (no verifies) is "ok" — the per-commit
     verify still gates each merge.
+
+    OBS-5: the rate is computed over all verify records MINUS failures a human has explicitly acknowledged
+    (`verify_failure_acknowledged`, matched by snapshot_id) — otherwise one caught-and-rolled-back failure
+    would degrade the all-time rate forever and permanently deadlock the C-2 live-commit gate. Acknowledged
+    failures stay in the audit and are reported here in `verify_failed_acknowledged`; an UNacknowledged
+    failure still degrades the report, fail-closed.
     """
     recs = prov.all_records()
-    verifies = [r for r in recs if r.get("activity") in VERIFY_ACTIVITIES and _has_pass(r)]
+    all_verifies = [r for r in recs if r.get("activity") in VERIFY_ACTIVITIES and _has_pass(r)]
+    acked_ids = _acknowledged_snapshot_ids(recs)
+    acked_failures = [r for r in all_verifies
+                      if r["params"].get("pass") is False and r.get("was_derived_from") in acked_ids]
+    _acked = {id(r) for r in acked_failures}
+    verifies = [r for r in all_verifies if id(r) not in _acked]
     passed = [r for r in verifies if r["params"]["pass"] is True]
     commits = [r for r in recs if r.get("activity") == "commit_merge"]
     rate = (len(passed) / len(verifies)) if verifies else None
@@ -85,6 +132,7 @@ def daily_report(prov: ProvenanceStore, *, sample_size: int = 10, ts: Optional[s
         "verify_pass_rate": rate,
         "verify_total": len(verifies),
         "verify_passed": len(passed),
+        "verify_failed_acknowledged": len(acked_failures),
         "merges_committed": len(commits),
         "prov_records": len(recs),
         "pass_rate_floor": pass_rate_floor,
