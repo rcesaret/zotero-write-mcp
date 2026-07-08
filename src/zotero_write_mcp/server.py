@@ -31,6 +31,10 @@ from zotero_write_mcp.observability import query_provenance as _eng_query_prov, 
 # PROV "informed-by" record.
 from zotero_write_mcp import sources as _eng_sources
 from zotero_write_mcp import validation as _eng_validation
+# Phase-4 ingest (sprint S4): the deterministic routed PDF->metadata extractor (TC-8).
+# extract_pdf_metadata below makes ZERO Zotero writes (INV-COMP) -- it only reads local files +
+# external authorities and logs a read-only PROV "informed-by" record.
+from zotero_write_mcp import ingest as _eng_ingest
 from zotero_write_mcp import __version__ as _ENGINE_VERSION
 
 mcp = FastMCP(
@@ -559,6 +563,71 @@ def validate_record(
         confidence=verdict["p"],
     )
     return json.dumps(verdict)
+
+
+@mcp.tool()
+def extract_pdf_metadata(
+    pdf_path: str,
+    md_path: str = "",
+    content_list_path: str = "",
+    mineru_report_path: str = "",
+    lang_hint: str = "",
+    route_hint: str = "",
+) -> str:
+    """Phase-4 ingest (sprint S4) — READ-ONLY. Extracts structured bibliographic metadata for a
+    PDF via the deterministic six-stage TC-8 pipeline (triage → route → structured parse →
+    authority match → cross-source agreement score → compose) and returns `{fields,
+    per_field_source, agreement_confidence, needs_review, needs_review_reasons, decision,
+    conflicts, evidence, route, validation, identifiers}`. Makes ZERO Zotero writes and zero
+    library mutations of any kind — it only reads local files (the PDF/md/MinerU artifacts) +
+    external authorities and logs a read-only PROV "informed-by" record. Confidence is
+    cross-source agreement, NEVER an LLM self-report: nothing here reads a caller-supplied
+    confidence/probability field (INV-COMP; any such key on a candidate is stripped before
+    scoring).
+
+    Degrades cleanly: when GROBID is not running (Path A unavailable) the parse falls back to the
+    mineru-markdown-fixer seed and the result is ALWAYS `needs_review=true`
+    ("path_b_never_auto_create" / "grobid_unavailable") — a degraded or Path-B parse never
+    auto-creates, no matter how well authorities agree (PLAN2 §5).
+
+    Args:
+        pdf_path: Path to the source PDF
+        md_path: Path to the mineru-markdown-fixer corrected .md (carries the YAML/BibTeX seed)
+        content_list_path: Path to MinerU's content_list.json (block-mix routing signal)
+        mineru_report_path: Path to the MinerU --json run-report (settings.is_ocr routing signal)
+        lang_hint: Language hint ("en", ...); wins over detection
+        route_hint: "stem" | "humanities" | "" — an owner/skill routing hint
+    """
+    result = _eng_ingest.extract_pdf_metadata(
+        pdf_path,
+        md_path=md_path,
+        content_list_path=content_list_path,
+        mineru_report_path=mineru_report_path,
+        lang_hint=lang_hint,
+        route_hint=route_hint,
+        grobid=_eng_ingest.GrobidClient(),
+    )
+
+    # Read-only PROV "informed-by" record mirroring validate_record's: an extraction CONSULTED
+    # local files + authorities; it is NOT a mutation. before/after are intentionally omitted
+    # (both json_sha256 stay null) so this record is unambiguously distinct from every
+    # create/update/merge PROV entry in the same log.
+    zot = get_client()
+    zot.prov.record(
+        activity="extract_pdf_metadata",
+        agent="ingest-engine", tool_version=_ENGINE_VERSION,
+        params={
+            "identity_sha256": _eng_validation.identity_sha256(result["fields"]),
+            "decision": result["decision"],
+            "p": result["agreement_confidence"],
+            "needs_review": result["needs_review"],
+            "route": result["route"]["decision"],
+            "parse_path": result["route"]["parse_path"],
+        },
+        source="; ".join(result["evidence"]) or None,
+        confidence=result["agreement_confidence"],
+    )
+    return json.dumps(result)
 
 
 @mcp.tool()
