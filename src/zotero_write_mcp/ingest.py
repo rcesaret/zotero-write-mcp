@@ -62,6 +62,12 @@ TEXT_LIKE_TYPES = {"text", "title", "table", "equation", "list", "code"}
 CONFIDENCE_LIKE_KEY_MARKERS = ("confidence", "probability", "certainty", "likelihood")
 CONFIDENCE_LIKE_EXACT_KEYS = {"score", "p", "p_raw", "self_confidence"}
 
+# PINNED (parameter-registry: the title-similarity CALIBRATE floor). The fixer-seed vs parsed-header
+# cross-check (the CRITICAL-1 fix): a Path-A GROBID (or Path-B LLM) header whose title agrees with
+# the file-grounded fixer seed's title below this floor describes a DIFFERENT work than the file ->
+# needs_review. Retune ONLY on labeled data; do not hand-drift.
+SEED_HEADER_TITLE_SIM_FLOOR = 0.75
+
 # The candidate field set (Zotero-native keys) a stage-3 parse may carry into scoring.
 CANDIDATE_FIELDS = ("itemType", "title", "creators", "date", "DOI", "publicationTitle", "bookTitle")
 # The fields stage 6 composes across authorities (bookTitle passes through from the candidate).
@@ -149,20 +155,29 @@ def detect_language(text: str) -> str:
     return "en" if ratio >= EN_STOPWORD_RATIO else "other"
 
 
-def read_mineru_is_ocr(report_path: str, pdf_path: str = "", md_path: str = "") -> Optional[bool]:
-    """Read ``settings.is_ocr`` from a MinerU ``--json`` run-report (a list of per-source dicts OR a
-    single dict). Matches the entry whose ``output_dir``/``markdown``/``source`` relates to
-    ``pdf_path``/``md_path`` (stem containment); if no entry matches but exactly one exists, uses
-    it. Ambiguity, absence, or any read error -> ``None`` (the signal honestly abstains)."""
+_MINERU_ENTRY_PATH_KEYS = ("output_dir", "markdown", "source")
+
+
+def _read_mineru_is_ocr(report_path: str, pdf_path: str = "",
+                        md_path: str = "") -> "tuple[Optional[bool], bool]":
+    """Internal reader behind :func:`read_mineru_is_ocr`; returns ``(is_ocr, exact)``.
+
+    ``exact`` is True only when the entry was selected by EXACT stem equality
+    (``Path(entry value).stem == stem`` for ``output_dir``/``markdown``/``source``). Anything
+    weaker that still yields a verdict — a single stem-CONTAINMENT hit, or the single-entry
+    fallback when NO stems were derivable — returns ``exact=False`` so the caller can record
+    ``"mineru_report:inexact_match"`` in the route reasons. When stems WERE derivable but match
+    no entry (exactly or by containment), the reader abstains (``None``) rather than adopting an
+    unrelated entry's verdict (W-4 tightening)."""
     try:
         with open(report_path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        return None
+        return None, True
     entries = data if isinstance(data, list) else [data]
     entries = [e for e in entries if isinstance(e, dict)]
     if not entries:
-        return None
+        return None, True
 
     stems = []
     for p in (pdf_path, md_path):
@@ -171,20 +186,47 @@ def read_mineru_is_ocr(report_path: str, pdf_path: str = "", md_path: str = "") 
             if stem:
                 stems.append(stem)
 
-    def _matches(entry: dict) -> bool:
+    def _entry_stems(entry: dict) -> list:
+        return [Path(str(entry.get(k, "")).replace("\\", "/")).stem.strip().lower()
+                for k in _MINERU_ENTRY_PATH_KEYS if entry.get(k)]
+
+    def _contains(entry: dict) -> bool:
         keys = " | ".join(
-            str(entry.get(k, "")) for k in ("output_dir", "markdown", "source")
+            str(entry.get(k, "")) for k in _MINERU_ENTRY_PATH_KEYS
         ).replace("\\", "/").lower()
         return any(stem in keys for stem in stems)
 
-    matched = [e for e in entries if _matches(e)] if stems else []
-    if not matched and len(entries) == 1:
-        matched = entries
+    exact = True
+    if stems:
+        matched = [e for e in entries
+                   if any(s in stems for s in _entry_stems(e))]     # exact stem equality first
+        if not matched:
+            matched = [e for e in entries if _contains(e)]          # containment fallback…
+            exact = False                                           # …is an inexact match
+        # Stems were derivable: NEVER fall back to an unrelated single entry (W-4).
+    elif len(entries) == 1:
+        matched = entries       # no stems derivable at all -> the single entry is the best guess…
+        exact = False           # …but it is document-uncorroborated (documented, flagged inexact)
+    else:
+        matched = []
     if len(matched) != 1:
-        return None
+        return None, True
     settings = matched[0].get("settings") or {}
     is_ocr = settings.get("is_ocr") if isinstance(settings, dict) else None
-    return is_ocr if isinstance(is_ocr, bool) else None
+    if not isinstance(is_ocr, bool):
+        return None, True
+    return is_ocr, exact
+
+
+def read_mineru_is_ocr(report_path: str, pdf_path: str = "", md_path: str = "") -> Optional[bool]:
+    """Read ``settings.is_ocr`` from a MinerU ``--json`` run-report (a list of per-source dicts OR a
+    single dict). Matches the entry whose ``output_dir``/``markdown``/``source`` relates to
+    ``pdf_path``/``md_path`` — EXACT stem equality preferred, a single stem-containment hit
+    otherwise. When stems are derivable but match nothing the signal honestly abstains (``None``);
+    only when NO stems were derivable does a lone entry get adopted. Ambiguity, absence, or any
+    read error -> ``None``."""
+    is_ocr, _exact = _read_mineru_is_ocr(report_path, pdf_path, md_path)
+    return is_ocr
 
 
 def read_block_mix(content_list_path: str) -> Optional[tuple]:
@@ -218,12 +260,15 @@ def _grobid_available(grobid: Any) -> bool:
 
 
 def _route(*, text_layer: Optional[str], md_text: str, mineru_is_ocr: Optional[bool],
-           block_mix: Optional[tuple], lang_hint: str, route_hint: str, grobid: Any) -> dict:
+           block_mix: Optional[tuple], lang_hint: str, route_hint: str, grobid: Any,
+           mineru_report_exact: bool = True) -> dict:
     """The PINNED deterministic routing table (parameter-registry; PLAN2 §6). Three signals vote
     born_digital/scanned (absent signals abstain); <2 votes OR any disagreement -> conservative
     ``scanned``. born-digital + English + not-humanities -> Path A (GROBID) when available, else
     Path B degraded; everything else -> Path B (the correct route, not degraded)."""
     reasons: list = []
+    # Normalize the route hint (mirror lang_hint below) — "Humanities" must guard like "humanities".
+    route_hint = str(route_hint or "").strip().lower()
 
     # signal (a): chars/page from the embedded text layer (pages via the form-feed convention).
     chars_per_page: Optional[float] = None
@@ -243,6 +288,10 @@ def _route(*, text_layer: Optional[str], md_text: str, mineru_is_ocr: Optional[b
         vote_b = "scanned"
     elif mineru_is_ocr is False:
         vote_b = "born_digital"
+    if mineru_is_ocr is not None and not mineru_report_exact:
+        # The report entry was matched by containment or the no-stems single-entry fallback —
+        # the signal still counts, but the inexact document correspondence is recorded (W-4).
+        reasons.append("mineru_report:inexact_match")
 
     # signal (c): content_list.json block mix.
     image_fraction: Optional[float] = None
@@ -570,13 +619,26 @@ def _norm_value(field: str, value: Any) -> str:
     return str(value or "")
 
 
-def _compose_fields(candidate: dict, cand_origins: dict, authority_dicts: list) -> tuple:
-    """Deterministic composition: >=2 distinct authorities agreeing on the normalized value ->
-    the VERBATIM value from the first authority (in list order) carrying it, source
-    ``consensus:<names>``; else candidate matching >=1 authority -> that authority's verbatim
-    value, source ``<authority name>``; else the candidate value, source = its origin."""
+def _compose_fields(candidate: dict, cand_origins: dict, authority_dicts: list,
+                    decision: str = "accept") -> tuple:
+    """Deterministic composition -> ``(fields, per_field_source, notes)``.
+
+    When ``decision == "accept"`` (candidate<->authority agreement is PROVEN by the gate):
+    >=2 distinct authorities agreeing on the normalized value -> the VERBATIM value from the first
+    authority (in list order) carrying it, source ``consensus:<names>``; else candidate matching
+    >=1 authority -> that authority's verbatim value, source ``<authority name>``; else the
+    candidate value, source = its origin.
+
+    When ``decision != "accept"`` (flagged/rejected): authority agreement may be agreement about a
+    DIFFERENT work — e.g. a foreign triage DOI (a cited work's DOI) drove the gather — so the
+    CANDIDATE's values WIN for every field the candidate carries (labeled by origin), and authority
+    values only FILL fields the candidate lacks, labeled ``... (gap-fill; unverified)`` with a
+    ``notes`` evidence line. The HITL queue must never see a different work's metadata wearing an
+    authoritative ``consensus:`` label."""
     fields: dict = {}
     per_field_source: dict = {}
+    notes: list = []
+    gap_filled: list = []
     views = [((d.get("source") or "authority"), _authority_zotero_view(d))
              for d in authority_dicts]
 
@@ -599,17 +661,36 @@ def _compose_fields(candidate: dict, cand_origins: dict, authority_dicts: list) 
                 consensus_key = nk
                 break
 
-        cand_v = candidate.get(f)
-        cand_nk = _norm_value(f, cand_v) if cand_v else ""
-
+        consensus_value = None
+        consensus_label = None
         if consensus_key is not None:
             group = by_nk[consensus_key]
             names: list = []
             for n, _ in group:
                 if n not in names:
                     names.append(n)
-            fields[f] = group[0][1]
-            per_field_source[f] = "consensus:" + ",".join(names)
+            consensus_value = group[0][1]
+            consensus_label = "consensus:" + ",".join(names)
+
+        cand_v = candidate.get(f)
+        cand_nk = _norm_value(f, cand_v) if cand_v else ""
+
+        if decision != "accept":
+            # Flagged/rejected record: the candidate wins; authorities only gap-fill.
+            if cand_v:
+                fields[f] = cand_v
+                per_field_source[f] = cand_origins.get(f, "fixer_seed")
+            elif entries:
+                if consensus_value is not None:
+                    src_v, src_label = consensus_value, consensus_label
+                else:
+                    src_label, src_v, _nk = entries[0]
+                fields[f] = src_v
+                per_field_source[f] = f"{src_label} (gap-fill; unverified)"
+                gap_filled.append(f)
+        elif consensus_value is not None:
+            fields[f] = consensus_value
+            per_field_source[f] = consensus_label
         elif cand_v and cand_nk and any(nk == cand_nk for _, _, nk in entries):
             name, v, _nk = next(e for e in entries if e[2] == cand_nk)
             fields[f] = v
@@ -624,7 +705,12 @@ def _compose_fields(candidate: dict, cand_origins: dict, authority_dicts: list) 
             fields[f] = candidate[f]
             per_field_source[f] = cand_origins.get(f, "fixer_seed")
 
-    return fields, per_field_source
+    if gap_filled:
+        notes.append("flagged-record gap-fill: authority values filled candidate-missing fields "
+                     f"[{', '.join(gap_filled)}] — UNVERIFIED against the file (the authority "
+                     "match may describe a different work)")
+
+    return fields, per_field_source, notes
 
 
 # ── the six-stage pipeline (TC-8) ─────────────────────────────────────────────────────────────────
@@ -647,7 +733,9 @@ def extract_pdf_metadata(
     deterministic six-stage pipeline. READ-ONLY: local file reads + external-authority reads only;
     zero Zotero writes. ``agreement_confidence`` is ALWAYS ``build_validation_result``'s calibrated
     ``p`` over cross-source authority agreement (INV-COMP); ``needs_review`` derives from the PINNED
-    gate's ``decision`` plus the Path-B never-auto-create rule — no threshold logic lives here.
+    gate's ``decision`` plus the Path-B never-auto-create rule plus the file-grounded corroboration
+    clauses (fixer-seed vs parsed-header title cross-check; Path A without any seed flags) — no
+    threshold logic lives here.
 
     Injectables (production callers pass ``grobid=GrobidClient()`` and leave the rest ``None``):
       text_extractor: embedded-text-layer reader (routing signal a); ``None`` -> signal absent.
@@ -671,18 +759,25 @@ def extract_pdf_metadata(
     identifiers = triage_identifiers(text_layer or "", md_text)
 
     # 2. ROUTE (deterministic table, no LLM).
+    mineru_is_ocr, mineru_report_exact = (
+        _read_mineru_is_ocr(mineru_report_path, pdf_path, md_path)
+        if mineru_report_path else (None, True))
     route = _route(
         text_layer=text_layer,
         md_text=md_text,
-        mineru_is_ocr=(read_mineru_is_ocr(mineru_report_path, pdf_path, md_path)
-                       if mineru_report_path else None),
+        mineru_is_ocr=mineru_is_ocr,
         block_mix=read_block_mix(content_list_path) if content_list_path else None,
         lang_hint=lang_hint,
         route_hint=route_hint,
         grobid=grobid,
+        mineru_report_exact=mineru_report_exact,
     )
 
     # 3. STRUCTURED PARSE -> candidate field set (a candidate is only ever a candidate).
+    # The fixer seed is ALWAYS parsed (not only as the Path-B fallback): it is the only
+    # FILE-GROUNDED evidence, and stage 5's needs_review cross-checks every parsed header
+    # against it (the CRITICAL-1 fix — a wrong-document header must not self-corroborate).
+    seed = _seed_candidate(md_text)
     candidate: Optional[dict] = None
     origin = "none"
     if route["decision"] == "path_a":
@@ -707,11 +802,9 @@ def extract_pdf_metadata(
             if isinstance(out, dict) and out:
                 candidate, origin = dict(out), "llm_header"
                 route["parse_path"] = "llm_header"
-        if candidate is None:
-            seed = _seed_candidate(md_text)
-            if seed:
-                candidate, origin = seed, "fixer_seed"
-                route["parse_path"] = "seed"
+        if candidate is None and seed:
+            candidate, origin = dict(seed), "fixer_seed"
+            route["parse_path"] = "seed"
 
     # INV-COMP: strip confidence-like keys from EVERY candidate origin, then restrict to the
     # pinned Zotero field set — nothing confidence-shaped can travel toward the gate.
@@ -760,8 +853,31 @@ def extract_pdf_metadata(
         doi_lookup_attempted=bool(doi), extra_evidence=gathered.evidence,
     )
 
-    # needs_review derives from decide()'s output + the Path-B never-auto-create rule (PLAN2 §5).
-    needs_review = (verdict["decision"] != "accept") or (route["parse_path"] != "grobid")
+    # File-grounded corroboration (the CRITICAL-1 fix). Cross-source authority agreement only
+    # certifies "the candidate is a real work" (authorities are fetched BY the candidate's own
+    # identifiers) — it never certifies "the candidate describes THIS pdf". The fixer seed is the
+    # only file-grounded evidence, so a parsed header (grobid OR llm) whose title disagrees with
+    # the seed's title flags, and Path A with NO seed at all flags for lack of corroboration.
+    # These are additional needs_review clauses on the S4 surface (mirroring
+    # path_b_never_auto_create); the PINNED decide() gate itself is untouched (INV-COMP).
+    seed_header_mismatch = False
+    mismatch_evidence: Optional[str] = None
+    seed_title = str((seed or {}).get("title") or "").strip()
+    cand_title = str(candidate.get("title") or "").strip()
+    if origin in ("grobid", "llm_header") and seed is not None and seed_title and cand_title:
+        from .utils import title_similarity  # lazy: utils imports httpx at module top (mirror validation.py)
+        if title_similarity(cand_title, seed_title) < SEED_HEADER_TITLE_SIM_FLOOR:
+            seed_header_mismatch = True
+            mismatch_evidence = (
+                f"seed_header_mismatch: parsed {origin} header title {cand_title[:80]!r} vs "
+                f"file-grounded fixer-seed title {seed_title[:80]!r} "
+                f"(similarity < {SEED_HEADER_TITLE_SIM_FLOOR})")
+    no_file_grounded_corroboration = (route["parse_path"] == "grobid" and seed is None)
+
+    # needs_review derives from decide()'s output + the Path-B never-auto-create rule (PLAN2 §5)
+    # + the file-grounded corroboration clauses above.
+    needs_review = ((verdict["decision"] != "accept") or (route["parse_path"] != "grobid")
+                    or seed_header_mismatch or no_file_grounded_corroboration)
     reasons: list = []
     if verdict["decision"] != "accept":
         reasons.append(f"decision:{verdict['decision']}")
@@ -770,13 +886,23 @@ def extract_pdf_metadata(
         reasons.append("id_disagreement")
     if route["parse_path"] != "grobid":
         reasons.append("path_b_never_auto_create")
+    if seed_header_mismatch:
+        reasons.append("seed_header_mismatch")
+    if no_file_grounded_corroboration:
+        reasons.append("no_file_grounded_corroboration")
     for r in route["reasons"]:
         if r in ("grobid_unavailable", "grobid_no_header") and r not in reasons:
             reasons.append(r)
 
-    # 6. RETURN — composed fields + the full computational verdict.
-    fields, per_field_source = _compose_fields(
-        candidate, cand_origins, [_rec_as_dict(r) for r in gathered.records])
+    # 6. RETURN — composed fields + the full computational verdict. Composition is keyed on the
+    # gate's decision: on anything but accept the candidate wins and authorities only gap-fill.
+    fields, per_field_source, compose_notes = _compose_fields(
+        candidate, cand_origins, [_rec_as_dict(r) for r in gathered.records],
+        decision=verdict["decision"])
+    evidence = list(verdict["evidence"])
+    if mismatch_evidence:
+        evidence.append(mismatch_evidence)
+    evidence.extend(compose_notes)
     return {
         "fields": fields,
         "per_field_source": per_field_source,
@@ -785,7 +911,7 @@ def extract_pdf_metadata(
         "needs_review_reasons": reasons,
         "decision": verdict["decision"],
         "conflicts": verdict["conflicts"],
-        "evidence": verdict["evidence"],
+        "evidence": evidence,
         "route": route,
         "validation": {
             "p": verdict["p"],

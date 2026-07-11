@@ -132,6 +132,38 @@ doi: 10.1234/abc
 Body text of the corrected markdown.
 """
 
+# A fixer seed for a DIFFERENT (correct, file-grounded) work than any parsed header below —
+# deliberately carries NO identifier (the typical humanities/book/scan md).
+SEED_MD_OTHER_WORK = """---
+title: "Colonial Land Tenure in the Basin of Mexico"
+author: "Sanders, William"
+year: 1979
+---
+
+# Colonial Land Tenure in the Basin of Mexico
+
+Body text of the corrected markdown; no identifier anywhere in this file.
+"""
+
+# A header for a DIFFERENT real work (anthology first-article / cover sheet / wrong pdf_path)
+# whose DOI is real — the CRITICAL-1 threat shape.
+WRONG_HEADER = {
+    "itemType": "journalArticle",
+    "title": "A Completely Different Published Article",
+    "creators": [{"creatorType": "author", "firstName": "A.", "lastName": "Wrong"}],
+    "date": "1999", "DOI": "10.9999/wrong", "publicationTitle": "Journal of Elsewhere",
+}
+
+
+def wrong_rec(source):
+    """The authority record RESOLVING the wrong header's (real) DOI — agreement is circular."""
+    return NormalizedRecord(source=source, title=WRONG_HEADER["title"],
+                            creators=[{"firstName": "A.", "lastName": "Wrong"}],
+                            year="1999", doi="10.9999/wrong",
+                            container_title="Journal of Elsewhere",
+                            item_type="journal-article")
+
+
 TEI = """<TEI xmlns="http://www.tei-c.org/ns/1.0">
   <teiHeader>
     <fileDesc>
@@ -262,6 +294,17 @@ def test_route_humanities_hint_forces_path_b_even_born_digital_en(tmp_path):
     assert "route_hint:humanities" in route["reasons"]
 
 
+def test_route_hint_normalized_humanities_variants(tmp_path):
+    # W-5 fix: the humanities guard survives casing/whitespace ("Humanities" -> path_b).
+    for hint in ("Humanities", "  HUMANITIES  "):
+        r = run_extract(tmp_path, text=EN_TEXT, is_ocr=False, blocks=blocks_mix(19, 1),
+                        route_hint=hint, md_text=SEED_MD,
+                        grobid=FakeGrobid(header=CORRECT_HEADER))
+        assert r["route"]["decision"] == "path_b"
+        assert r["route"]["degraded"] is False
+        assert "route_hint:humanities" in r["route"]["reasons"]
+
+
 def test_route_discordant_signals_conservative_scanned(tmp_path):
     # is_ocr says scanned, text density + block mix say born-digital -> disagreement -> scanned.
     r = run_extract(tmp_path, text=EN_TEXT, is_ocr=True, blocks=blocks_mix(19, 1))
@@ -329,6 +372,58 @@ def test_wrong_llm_header_forces_review(tmp_path):
     assert "path_b_never_auto_create" in r["needs_review_reasons"]
 
 
+# ═══ 3b. FILE-GROUNDED CORROBORATION — a wrong-document header must not self-corroborate ═════════
+
+def test_wrong_grobid_header_forces_review(tmp_path):
+    """THE CRITICAL-1 repro (the grobid mirror of test_wrong_llm_header_forces_review): GROBID
+    returns a header for a DIFFERENT real work whose DOI resolves at >=2 authorities. The gate
+    legitimately says "accept" (the candidate IS a real work — authorities were fetched BY its own
+    DOI, so agreement is circular), but the FILE-GROUNDED fixer seed disagrees on title, so
+    needs_review must be True with "seed_header_mismatch". agreement_confidence is untouched
+    (INV-COMP: still the calibrated cross-source p — the cross-check adds a review clause, never
+    a score change, and the PINNED decide() gate is untouched)."""
+    auths = [FakeAuthority("crossref", wrong_rec("crossref")),
+             FakeAuthority("openalex", wrong_rec("openalex"))]
+    r = run_extract(tmp_path, text=EN_TEXT, is_ocr=False, blocks=blocks_mix(19, 1),
+                    md_text=SEED_MD_OTHER_WORK,
+                    grobid=FakeGrobid(header=WRONG_HEADER), authorities=auths)
+    assert r["route"]["parse_path"] == "grobid"
+    assert r["decision"] == "accept"                     # the PINNED gate itself is untouched...
+    assert r["agreement_confidence"] >= ACCEPT_P_FLOOR   # ...and p stays the calibrated consensus p
+    assert r["needs_review"] is True                     # ...but the S4 surface flags it
+    assert "seed_header_mismatch" in r["needs_review_reasons"]
+    # the evidence line quotes BOTH titles so the HITL reviewer sees the disagreement verbatim.
+    assert any("seed_header_mismatch" in e and "Colonial Land Tenure" in e
+               and "Completely Different" in e for e in r["evidence"])
+
+
+def test_path_a_no_seed_flags_no_file_grounded_corroboration(tmp_path):
+    """Path A with NO fixer seed at all (no md): even a clean consensus accept has zero
+    file-grounded corroboration -> needs_review with exactly that reason (decision untouched)."""
+    auths = [FakeAuthority("crossref", rec("crossref")),
+             FakeAuthority("openalex", rec("openalex"))]
+    r = run_extract(tmp_path, text=EN_TEXT, is_ocr=False, blocks=blocks_mix(19, 1),
+                    grobid=FakeGrobid(header=CORRECT_HEADER), authorities=auths)
+    assert r["route"]["parse_path"] == "grobid"
+    assert r["decision"] == "accept"
+    assert r["agreement_confidence"] >= ACCEPT_P_FLOOR
+    assert r["needs_review"] is True
+    assert r["needs_review_reasons"] == ["no_file_grounded_corroboration"]
+
+
+def test_wrong_llm_header_vs_seed_mismatch_recorded(tmp_path):
+    """An LLM header disagreeing with an existing seed: Path B already never auto-creates, but the
+    queue record now honestly carries "seed_header_mismatch" alongside path_b_never_auto_create."""
+    auths = [FakeAuthority("crossref", wrong_rec("crossref")),
+             FakeAuthority("openalex", wrong_rec("openalex"))]
+    r = run_extract(tmp_path, md_text=SEED_MD_OTHER_WORK,
+                    llm=lambda md: dict(WRONG_HEADER), authorities=auths)
+    assert r["route"]["parse_path"] == "llm_header"
+    assert r["needs_review"] is True
+    assert "path_b_never_auto_create" in r["needs_review_reasons"]
+    assert "seed_header_mismatch" in r["needs_review_reasons"]
+
+
 # ═══ 4. confidence-strip: identical candidate ± confidence keys -> identical verdict ═════════════
 
 def test_confidence_keys_stripped_verdict_identical(tmp_path):
@@ -358,9 +453,14 @@ def test_strip_confidence_keys_unit():
 # ═══ 5. correct Path-A consensus accept (the F.1 auto-create-eligibility fixture) ════════════════
 
 def test_path_a_consensus_accept_not_flagged(tmp_path):
+    """STRENGTHENED (CRITICAL-1 fix): auto-create eligibility now ALSO requires file-grounded
+    corroboration — the fixer seed's title must agree with the GROBID header's. This fixture
+    carries a matching seed (SEED_MD), so needs_review stays False; the seed-less variant is
+    test_path_a_no_seed_flags_no_file_grounded_corroboration."""
     auths = [FakeAuthority("crossref", rec("crossref")),
              FakeAuthority("openalex", rec("openalex"))]
     r = run_extract(tmp_path, text=EN_TEXT, is_ocr=False, blocks=blocks_mix(19, 1),
+                    md_text=SEED_MD,
                     grobid=FakeGrobid(header=CORRECT_HEADER), authorities=auths)
     assert r["route"]["parse_path"] == "grobid"
     assert r["decision"] == "accept"                 # cold-start consensus floor 0.92 >= 0.90
@@ -368,7 +468,9 @@ def test_path_a_consensus_accept_not_flagged(tmp_path):
     assert r["needs_review"] is False
     assert r["needs_review_reasons"] == []
     assert r["validation"]["consensus"] is True and r["validation"]["id_agreement"] is True
-    # DOI known from the grobid header -> the doi leg (not search) gathered authorities.
+    # Accept-path composition unchanged: consensus values still win on accept.
+    assert r["per_field_source"]["title"] == "consensus:crossref,openalex"
+    # DOI known from triage over the seed md (same DOI as the header) -> the doi leg gathered.
     assert auths[0].doi_calls == [DOI] and not auths[0].search_calls
 
 
@@ -476,6 +578,64 @@ def test_triage_doi_fill_labeled_triage(tmp_path):
     assert r["per_field_source"]["DOI"] == "triage"
 
 
+def _foreign_work_rec(source):
+    """Work Y — a DIFFERENT work than the candidate, resolved via a foreign (cited) DOI."""
+    return NormalizedRecord(source=source, title="Urban Scaling in Ancient Mesoamerica",
+                            creators=[{"firstName": "Michael", "lastName": "Smith"}],
+                            year="2019", doi="10.5555/other-work",
+                            container_title="PNAS", item_type="journal-article")
+
+
+def test_foreign_doi_flagged_record_candidate_wins_authority_gap_fill_labeled(tmp_path):
+    """The attach-citekey WARNING repro: candidate = work X (seed, no own DOI); the body cites
+    work Y's DOI, triage injects it, >=2 authorities resolve Y and agree WITH EACH OTHER. The
+    verdict flags (candidate vs authority disagreement) — and on a flagged record the candidate's
+    values must WIN: the HITL queue must never see work Y's metadata wearing an authoritative
+    "consensus:" label. Authority values only gap-fill candidate-missing fields, loudly labeled."""
+    md = "---\ntitle: \"Colonial Land Tenure in the Basin of Mexico\"\n" \
+         "author: \"Sanders, William\"\nyear: 1979\n---\n\n" \
+         "Body cites https://doi.org/10.5555/other-work in passing.\n"
+    auths = [FakeAuthority("crossref", _foreign_work_rec("crossref")),
+             FakeAuthority("openalex", _foreign_work_rec("openalex"))]
+    r = run_extract(tmp_path, md_text=md, authorities=auths)
+    assert r["decision"] != "accept"
+    assert r["needs_review"] is True
+    # the candidate's (work X's) values WIN, labeled by their true origin:
+    assert r["fields"]["title"] == "Colonial Land Tenure in the Basin of Mexico"
+    assert r["per_field_source"]["title"] == "fixer_seed"
+    assert r["fields"]["creators"][0]["lastName"] == "Sanders"
+    assert r["per_field_source"]["creators"] == "fixer_seed"
+    assert r["fields"]["date"] == "1979"
+    assert r["per_field_source"]["date"] == "fixer_seed"
+    # the foreign DOI keeps its honest origin label (triage), never "consensus":
+    assert r["fields"]["DOI"] == "10.5555/other-work"
+    assert r["per_field_source"]["DOI"] == "triage"
+    # authority values only FILL candidate-missing fields, labeled as unverified gap-fill:
+    assert r["fields"]["publicationTitle"] == "PNAS"
+    assert r["per_field_source"]["publicationTitle"] == \
+        "consensus:crossref,openalex (gap-fill; unverified)"
+    assert r["per_field_source"]["itemType"] == \
+        "consensus:crossref,openalex (gap-fill; unverified)"
+    # no field on this flagged record wears a bare authoritative consensus label:
+    assert all("(gap-fill; unverified)" in s or not s.startswith("consensus:")
+               for s in r["per_field_source"].values())
+    # and the gap-fill is called out in the evidence for the HITL reviewer:
+    assert any("gap-fill" in e for e in r["evidence"])
+
+
+def test_accept_composition_unchanged_consensus_still_wins(tmp_path):
+    """On decision == "accept" (agreement PROVEN) composition is unchanged: consensus values still
+    win — even on Path B where needs_review stays True (path_b_never_auto_create)."""
+    auths = [FakeAuthority("crossref", rec("crossref")),
+             FakeAuthority("openalex", rec("openalex"))]
+    r = run_extract(tmp_path, md_text=SEED_MD, authorities=auths)
+    assert r["decision"] == "accept"
+    assert r["needs_review"] is True                 # Path B: review, but composition is trusted
+    assert r["per_field_source"]["title"] == "consensus:crossref,openalex"
+    assert r["per_field_source"]["DOI"] == "consensus:crossref,openalex"
+    assert not any("gap-fill" in s for s in r["per_field_source"].values())
+
+
 # ═══ 11. content_list.json block-mix reader ══════════════════════════════════════════════════════
 
 def test_block_mix_text_heavy_and_image_heavy(tmp_path):
@@ -519,10 +679,58 @@ def test_mineru_report_list_with_matching_output_dir(tmp_path):
 
 
 def test_mineru_report_single_dict_form(tmp_path):
+    """STRENGTHENED (W-4 fix): a single entry with ZERO stem relation to the pdf is no longer
+    adopted when stems WERE derivable — the reader abstains. Only when the caller supplies no
+    pdf/md path at all (no stems derivable) is the lone entry adopted (documented fallback)."""
     p = tmp_path / "report.json"
     p.write_text(json.dumps({"source": "./whatever.pdf", "settings": {"is_ocr": True}}),
                  encoding="utf-8")
-    assert I.read_mineru_is_ocr(str(p), pdf_path="C:/in/unrelated.pdf") is True
+    assert I.read_mineru_is_ocr(str(p), pdf_path="C:/in/unrelated.pdf") is None
+    assert I.read_mineru_is_ocr(str(p)) is True      # no stems derivable -> adopted (documented)
+    assert I.read_mineru_is_ocr(str(p), pdf_path="C:/in/whatever.pdf") is True  # exact stem
+
+
+def test_mineru_exact_stem_beats_containment(tmp_path):
+    # BOTH entries contain the stem "paper" as a substring; exact stem equality must select the
+    # right one (the old containment-only matcher saw two hits -> ambiguous -> None).
+    p = tmp_path / "report.json"
+    p.write_text(json.dumps([
+        {"source": "./paper.pdf", "settings": {"is_ocr": False}},
+        {"source": "./paper_appendix.pdf", "settings": {"is_ocr": True}},
+    ]), encoding="utf-8")
+    assert I.read_mineru_is_ocr(str(p), pdf_path="C:/in/paper.pdf") is False
+    assert I._read_mineru_is_ocr(str(p), pdf_path="C:/in/paper.pdf") == (False, True)
+
+
+def test_mineru_superset_stem_containment_matches_but_inexact(tmp_path):
+    # No exact stem entry exists; a SINGLE superset-stem containment hit still matches, but is
+    # reported inexact so the route can record it.
+    p = tmp_path / "report.json"
+    p.write_text(json.dumps([{"source": "./smith2020_appendix.pdf",
+                              "settings": {"is_ocr": True}}]), encoding="utf-8")
+    assert I._read_mineru_is_ocr(str(p), pdf_path="C:/in/smith2020.pdf") == (True, False)
+    assert I.read_mineru_is_ocr(str(p), pdf_path="C:/in/smith2020.pdf") is True
+
+
+def test_mineru_inexact_match_recorded_in_route_reasons(tmp_path):
+    # The signal still counts (votes scanned) but the inexact document correspondence is
+    # recorded in route reasons (W-4 observability).
+    pdf = tmp_path / "smith2020.pdf"
+    pdf.write_bytes(b"%PDF-1.4 offline fixture")
+    rep = tmp_path / "report.json"
+    rep.write_text(json.dumps([{"source": "./smith2020_appendix.pdf",
+                                "settings": {"is_ocr": True}}]), encoding="utf-8")
+    r = I.extract_pdf_metadata(str(pdf), mineru_report_path=str(rep), authorities=[],
+                               calibration_path=str(tmp_path / "no-such-calibration.json"))
+    assert r["route"]["signals"]["votes"]["mineru_is_ocr"] == "scanned"
+    assert "mineru_report:inexact_match" in r["route"]["reasons"]
+
+
+def test_mineru_exact_match_leaves_no_inexact_reason(tmp_path):
+    # run_extract's report entry (source ./paper.pdf) exactly matches paper.pdf -> no flag.
+    r = run_extract(tmp_path, text="x" * 12, is_ocr=True, blocks=blocks_mix(2, 8))
+    assert r["route"]["signals"]["votes"]["mineru_is_ocr"] == "scanned"
+    assert "mineru_report:inexact_match" not in r["route"]["reasons"]
 
 
 def test_mineru_report_missing_or_ambiguous_abstains(tmp_path):
