@@ -12,15 +12,25 @@ import time
 from typing import Any
 
 
-def web_items(client: Any, *, item_type: str = "-attachment", page: int = 100) -> list:
-    """Page through every LIVE (non-trashed) library item via ``GET /items``. Read-only."""
+def web_items(client: Any, *, item_type: str = "-attachment", page: int = 100,
+             include_trashed: bool = False) -> list:
+    """Page through library items via ``GET /items``. Read-only.
+
+    By default excludes trash (matches the platform default). ``include_trashed=True`` adds
+    ``includeTrashed=1`` — needed by any orphan-file check comparing storage-dir keys against
+    attachment items, since a TRASHED attachment still owns its on-disk file (not yet purged) and
+    would otherwise be misreported as orphaned.
+    """
     out: list = []
     start = 0
     while True:
+        params = {"limit": page, "start": start, "itemType": item_type, "format": "json"}
+        if include_trashed:
+            params["includeTrashed"] = 1
         r = client._client.get(
             f"{client.web_url}/users/{client.library_id}/items",
             headers=client._web_headers,
-            params={"limit": page, "start": start, "itemType": item_type, "format": "json"},
+            params=params,
         )
         if r.status_code == 429:
             time.sleep(int(r.headers.get("Retry-After", "5")))

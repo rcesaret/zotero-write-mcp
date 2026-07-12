@@ -66,3 +66,15 @@ def test_web_items_honors_item_type_param():
     client = FakeClient([[]])
     web_items(client, item_type="attachment")
     assert client._client.calls[0]["itemType"] == "attachment"
+
+
+def test_web_items_include_trashed_adds_param():
+    client = FakeClient([[]])
+    web_items(client, include_trashed=True)
+    assert client._client.calls[0]["includeTrashed"] == 1
+
+
+def test_web_items_excludes_trashed_by_default():
+    client = FakeClient([[]])
+    web_items(client)
+    assert "includeTrashed" not in client._client.calls[0]
