@@ -149,6 +149,49 @@ def daily_report(prov: ProvenanceStore, *, sample_size: int = 10, ts: Optional[s
     return {**metrics, "ts": rec["ts"], "sampled_audit": sampled_audit}
 
 
+def prov_coverage_report(prov: ProvenanceStore, *, recent_n: int = 20) -> dict:
+    """S5a F2: the owner-facing "did every mutation get audited?" answer (ADR-008 interlock — the
+    PROV store IS the rollback index, so its coverage is only trustworthy if it's visible). Read-only
+    aggregation over the WHOLE append-only log: total record count, a per-activity breakdown, the same
+    verify-pass-rate computation `daily_report` uses (reusing `VERIFY_ACTIVITIES` / the OBS-5
+    acknowledge exclusion, so the two never drift apart), and the last `recent_n` merges with their
+    before/after sha256 for a spot-check. Makes NO write of any kind (not even a marker append) —
+    unlike `daily_report`, this is pure reporting."""
+    recs = prov.all_records()
+    by_activity: dict = {}
+    for r in recs:
+        a = r.get("activity") or "?"
+        by_activity[a] = by_activity.get(a, 0) + 1
+
+    all_verifies = [r for r in recs if r.get("activity") in VERIFY_ACTIVITIES and _has_pass(r)]
+    acked_ids = _acknowledged_snapshot_ids(recs)
+    acked_failures = [r for r in all_verifies
+                      if r["params"].get("pass") is False and r.get("was_derived_from") in acked_ids]
+    _acked = {id(r) for r in acked_failures}
+    verifies = [r for r in all_verifies if id(r) not in _acked]
+    passed = [r for r in verifies if r["params"]["pass"] is True]
+
+    commits = [r for r in recs if r.get("activity") == "commit_merge"]
+    recent_merges = [{
+        "item_key": (r.get("entity") or {}).get("item_key"),
+        "ts": r.get("ts"),
+        "snapshot_id": r.get("was_derived_from"),
+        "before_sha256": (r.get("entity") or {}).get("before_sha256"),
+        "after_sha256": (r.get("entity") or {}).get("after_sha256"),
+    } for r in commits[-recent_n:]]
+
+    return {
+        "total_records": len(recs),
+        "by_activity": by_activity,
+        "verify_total": len(verifies),
+        "verify_passed": len(passed),
+        "verify_pass_rate": (len(passed) / len(verifies)) if verifies else None,
+        "verify_failed_acknowledged": len(acked_failures),
+        "merges_committed": len(commits),
+        "recent_merges": recent_merges,
+    }
+
+
 def latest_daily_report(prov: ProvenanceStore) -> Optional[dict]:
     reps = [r for r in prov.all_records() if r.get("activity") == "daily_report"]
     return reps[-1] if reps else None

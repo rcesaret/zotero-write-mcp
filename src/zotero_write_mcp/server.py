@@ -19,13 +19,21 @@ from zotero_write_mcp.utils import (
 # @mcp.tool() function names).
 from zotero_write_mcp.merge import (
     snapshot_cluster as _eng_snapshot, build_cluster as _eng_build, rollback_merge as _eng_rollback,
+    shadow_merge as _eng_shadow_merge,
 )
 from zotero_write_mcp.merge_live import (
     merge_cluster as _eng_merge, commit_merge as _eng_commit, load_snapshot as _eng_load_snapshot,
-    reconcile_orphan_commits as _eng_reconcile, WebClusterReader,
+    reconcile_orphan_commits as _eng_reconcile, WebClusterReader, library_item_base,
 )
 from zotero_write_mcp.dedup import dedup_scan as _eng_dedup
-from zotero_write_mcp.observability import query_provenance as _eng_query_prov, daily_report as _eng_daily
+from zotero_write_mcp.observability import (
+    query_provenance as _eng_query_prov, daily_report as _eng_daily,
+    prov_coverage_report as _eng_prov_coverage,
+)
+# S5a (Phase-6 tooling): read-only observability + tooling — a library-wide citekey scanner and the
+# web-API pager it (and the dashboard) share. NEVER a Zotero mutation path.
+from zotero_write_mcp.webscan import web_items as _eng_web_items
+from zotero_write_mcp import citekeys as _eng_citekeys
 # Phase-3 validation (sprint S3): read-only source clients + the pure scorer/gate. validate_record
 # below makes ZERO Zotero writes (INV-COMP) -- it only reads external authorities + logs a read-only
 # PROV "informed-by" record.
@@ -1031,6 +1039,76 @@ def merge_health_report() -> str:
     """Compute + record the daily merge-health marker (verify-pass-rate, merges-committed, sampled audit).
     The marker gates live commits — commit_merge refuses on a stale or below-floor (degraded) report."""
     return json.dumps(_eng_daily(get_client().prov), default=str)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  S5a — PHASE-6 READ-ONLY TOOLING (dashboard + doctor support; NEVER a Zotero mutation)
+# ═══════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def prov_coverage_report(recent_n: int = 20) -> str:
+    """S5a F2: the owner-facing "did every mutation get audited?" answer (ADR-008 interlock — PROV
+    IS the rollback index). Read-only aggregation over the whole append-only PROV log: total record
+    count, a per-activity breakdown, the verify-pass-rate (same computation `daily_report` uses, incl.
+    the OBS-5 acknowledge exclusion), and the last `recent_n` merges with their before/after sha256 for
+    a spot-check. Makes NO write of any kind — unlike merge_health_report, not even a marker append."""
+    return json.dumps(_eng_prov_coverage(get_client().prov, recent_n=recent_n), default=str)
+
+
+@mcp.tool()
+def preview_merge(master_key: str, dup_keys: list, field_sources: Optional[dict] = None,
+                  smart_fill: bool = False) -> str:
+    """S5a F6: read-only "what would this merge do" preview. Reuses `shadow_merge`
+    (snapshot -> compute_merge_projection -> verify_merge -> log) — structurally read-only, takes NO
+    gateway, cannot write to the library. Returns the survivor field changes, which of the 11 verify
+    checks pass, the post-merge collections/tags, and the trash-would-be set. Owner ergonomics for
+    inspecting one merge before committing; also what the human-review queue and a supervised live
+    cycle preview a cluster with before its one live commit."""
+    zot = get_client()
+    reader = WebClusterReader(zot, zot.library_id)
+    sm_before = reader.get_item(master_key).get("data", {})
+    base = library_item_base("user", zot.library_id)
+    sr = _eng_shadow_merge(reader, master_key, list(dup_keys), prov=zot.prov, smart_fill=smart_fill,
+                           field_sources=field_sources, library_base=base)
+    survivor = sr.projection.items[master_key]
+    watch_fields = set(list(field_sources or {}) + ["extra"])
+    changes = {f: {"from": sm_before.get(f), "to": survivor.fields.get(f)}
+              for f in watch_fields if survivor.fields.get(f) != sm_before.get(f)}
+    return json.dumps({
+        "snapshot_id": sr.snapshot_id,
+        "verify_pass": sr.passed,
+        "checks": [{"number": c.number, "name": c.name, "pass": c.passed, "detail": c.detail}
+                   for c in sr.integrity.checks],
+        "survivor_changes": changes,
+        "trash_would_be": list(dup_keys),
+        "collections_after": survivor.collections,
+        "tags_after": survivor.tags,
+    })
+
+
+@mcp.tool()
+def citekey_audit_report(check_aliases: bool = True) -> str:
+    """S5a F7: read-only, whole-library citekey-collision + tex.ids alias-survival sweep. (a) Groups
+    every live item's BBT citekey (pinned `extra` Citation Key: line, else `citationKey`) and reports
+    any duplicate (a collision silently breaks the downstream Pandoc @citekey pipeline). (b) If
+    `check_aliases`, for every live item carrying a `dc:replaces` relation (a merge survivor), confirms
+    each trashed target's own citekey survives as a `tex.ids:` alias on the survivor's `extra` — an
+    individual GET per dc:replaces pair (currently ~151 from the S2 mass merge), so this can take a
+    while; pass `check_aliases=False` for the collision-only pass. Paged via the Web API (never the
+    local API), so it is unaffected by local-API host-health degradation."""
+    zot = get_client()
+    items = _eng_web_items(zot)
+    collisions = _eng_citekeys.scan_citekey_collisions(items)
+    aliases = None
+    if check_aliases:
+        def _lookup(key: str):
+            try:
+                return zot.get_item_web(key)
+            except Exception:
+                return None
+        aliases = _eng_citekeys.scan_tex_ids_aliases(items, _lookup)
+    return json.dumps({"collisions": collisions, "tex_ids_aliases": aliases}, default=str)
 
 
 @mcp.tool()

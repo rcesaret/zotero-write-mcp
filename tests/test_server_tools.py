@@ -153,6 +153,91 @@ def test_bulk_link_files_rejects_linked_mode_and_defaults_imported():
     assert inspect.signature(_tool_fn("bulk_link_files")).parameters["mode"].default == "imported"
 
 
+# ── S5a Phase-6 tooling: prov_coverage_report / preview_merge / citekey_audit_report ────────────────
+
+def test_s5a_readonly_tools_registered():
+    assert all(hasattr(server, t)
+              for t in ["prov_coverage_report", "preview_merge", "citekey_audit_report"])
+
+
+def test_prov_coverage_report_tool_delegates_to_engine(monkeypatch):
+    _stub_client(monkeypatch)
+    monkeypatch.setattr(server, "_eng_prov_coverage",
+                        lambda prov, *, recent_n: {"total_records": 3, "recent_n_used": recent_n})
+    out = json.loads(_tool_fn("prov_coverage_report")(recent_n=5))
+    assert out == {"total_records": 3, "recent_n_used": 5}
+
+
+def test_preview_merge_tool_is_structurally_read_only(monkeypatch):
+    """preview_merge must never touch the gateway — only the reader (for the pre-merge field values)
+    and shadow_merge (which itself takes no gateway)."""
+    captured = {}
+
+    class _FakeReader:
+        def get_item(self, key):
+            return {"data": {"title": "old title", "extra": ""}}
+
+    class _Item:
+        def __init__(self, fields, collections, tags):
+            self.fields, self.collections, self.tags = fields, collections, tags
+
+    class _Check:
+        def __init__(self, n, name, passed):
+            self.number, self.name, self.passed, self.detail = n, name, passed, ""
+
+    class _Integrity:
+        checks = [_Check(1, "item-type-equality", True), _Check(11, "citekey-preservation", True)]
+
+    class _Projection:
+        items = {"M": _Item({"title": "new title", "extra": "tex.ids: dupKey"}, ["C1"], [("t", 1)])}
+
+    class _ShadowReport:
+        snapshot_id, passed, integrity, projection = "SID1", True, _Integrity(), _Projection()
+
+    _stub_client(monkeypatch)
+    monkeypatch.setattr(server, "WebClusterReader", lambda c, lib: _FakeReader())
+
+    def _fake_shadow(reader, master, dups, *, prov, smart_fill, field_sources, library_base):
+        captured["gateway_passed"] = "gateway" in locals()
+        return _ShadowReport()
+
+    monkeypatch.setattr(server, "_eng_shadow_merge", _fake_shadow)
+    # field_sources={"title": "D1"} is what would legitimately change "title" in a real projection
+    # (compute_merge_projection never alters a scalar field outside field_sources + the extra alias).
+    out = json.loads(_tool_fn("preview_merge")("M", ["D1"], field_sources={"title": "D1"}))
+    assert out["snapshot_id"] == "SID1"
+    assert out["verify_pass"] is True
+    assert out["trash_would_be"] == ["D1"]
+    assert out["survivor_changes"]["title"] == {"from": "old title", "to": "new title"}
+    assert out["survivor_changes"]["extra"]["to"] == "tex.ids: dupKey"
+    assert out["collections_after"] == ["C1"]
+    # the fake shadow_merge signature has no `gateway` parameter at all -- proves preview_merge never
+    # threads one through, mirroring shadow_merge's own no-gateway shape.
+    import inspect
+    assert "gateway" not in inspect.signature(_fake_shadow).parameters
+
+
+def test_citekey_audit_report_tool_collision_only(monkeypatch):
+    _stub_client(monkeypatch)
+    monkeypatch.setattr(server, "_eng_web_items", lambda client, **k: [{"key": "A"}, {"key": "B"}])
+    monkeypatch.setattr(server._eng_citekeys, "scan_citekey_collisions",
+                        lambda items: {"collision_count": 0, "items_scanned": len(items)})
+    out = json.loads(_tool_fn("citekey_audit_report")(check_aliases=False))
+    assert out["collisions"]["items_scanned"] == 2
+    assert out["tex_ids_aliases"] is None
+
+
+def test_citekey_audit_report_tool_includes_alias_check_by_default(monkeypatch):
+    _stub_client(monkeypatch)
+    monkeypatch.setattr(server, "_eng_web_items", lambda client, **k: [{"key": "A"}])
+    monkeypatch.setattr(server._eng_citekeys, "scan_citekey_collisions",
+                        lambda items: {"collision_count": 0})
+    monkeypatch.setattr(server._eng_citekeys, "scan_tex_ids_aliases",
+                        lambda items, lookup: {"missing_alias_count": 0})
+    out = json.loads(_tool_fn("citekey_audit_report")())
+    assert out["tex_ids_aliases"] == {"missing_alias_count": 0}
+
+
 def test_create_linked_file_attachment_raises_at_client():
     """S0 C.5: the deepest layer (client) hard-refuses too — a direct caller cannot create a linked
     attachment via the ZoteroClient method."""
