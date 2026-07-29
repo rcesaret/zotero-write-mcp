@@ -125,7 +125,14 @@ def test_local_api_latency_fail_on_exception(monkeypatch):
 def test_readiness_report_verdicts_true_when_all_pass(tmp_path, monkeypatch):
     monkeypatch.delenv(ENABLE_ENV, raising=False)
     prov = ProvenanceStore(tmp_path)
-    now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=timezone.utc)
+    # Seed the daily_report RELATIVE to the real clock, not at a fixed date.
+    # readiness_report() -> observability_freshness_row(prov) measures freshness against
+    # datetime.now(timezone.utc) with a 48h window, so a hardcoded `now` made this test a
+    # time bomb: it passed only within 48h of the pinned date and failed forever after
+    # (correctly -- a stale observability report genuinely should block a live merge).
+    # Keeping the fixture 1h old preserves exactly what this test asserts (all rows pass
+    # => both verdicts true) while making it clock-independent.
+    now = datetime.now(timezone.utc)
     daily_report(prov, ts=(now - timedelta(hours=1)).isoformat())
     monkeypatch.setattr(httpx, "get", lambda *a, **k: _FakeResponse(200))
     rep = readiness.readiness_report(prov, probe_local_api=True)
