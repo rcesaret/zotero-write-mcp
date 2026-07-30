@@ -174,16 +174,42 @@ class ProvenanceStore:
         line = json.dumps(rec, ensure_ascii=False)
         with self._lock:
             with open(self.prov_path, "a", encoding="utf-8") as f:
+                # Newline-defensive append (Routine Supervised v1.0, LOG-002; intent of engine commit
+                # ef9bf67 reimplemented on the clean base): if the file does not currently end in a
+                # newline — a crash between write and fsync, or a torn line from a cross-process writer
+                # (the lock is threading-only, and operator scripts open their own store on the same
+                # ZOTERO_PROV_DIR) — appending directly would CONCATENATE this record onto the broken
+                # tail, making BOTH unparseable. Terminating the tail first costs one seek and loses
+                # nothing: the torn fragment stays on its own line where the integrity scan reports it.
+                if self._needs_leading_newline():
+                    f.write("\n")
                 f.write(line + "\n")
                 f.flush()
                 os.fsync(f.fileno())
         return rec
 
+    def _needs_leading_newline(self) -> bool:
+        """True iff the log is non-empty and its last byte is not a newline. Never raises — on any read
+        error it returns False, which preserves plain-append behaviour rather than blocking a write."""
+        try:
+            if not self.prov_path.exists() or self.prov_path.stat().st_size == 0:
+                return False
+            with open(self.prov_path, "rb") as fh:
+                fh.seek(-1, os.SEEK_END)
+                return fh.read(1) != b"\n"
+        except OSError:
+            return False
+
     def iter_records(self) -> Iterator[dict]:
         """Yield every PROV record in append order.
 
-        A partially-written trailing line (e.g., a crash mid-append) is detected and stops
-        iteration cleanly rather than raising — earlier records remain readable.
+        A malformed line (crash mid-append, or a torn line from a cross-process writer) is SKIPPED,
+        not fatal, and does not stop iteration (LOG-002; intent of engine commit ef9bf67). The old
+        ``break`` behaviour made every record AFTER a malformed line invisible, so a single stray byte
+        blinded readers to the whole tail — including a real verify failure. Skipping keeps the tail
+        visible; the malformed line itself is NOT silently forgotten: :meth:`scan_integrity` reports
+        every bad line, and destructive readiness fails closed until each one is explicitly accepted
+        (LOG-001). Query paths get the valid records; gating paths must consult ``scan_integrity``.
         """
         if not self.prov_path.exists():
             return
@@ -192,10 +218,101 @@ class ProvenanceStore:
                 line = line.strip()
                 if not line:
                     continue
+                if len(line) > self.MAX_LINE_BYTES:
+                    continue   # oversized line: unparseable by policy; scan_integrity reports it
                 try:
                     yield json.loads(line)
                 except json.JSONDecodeError:
-                    break
+                    continue   # skip, never `break` — a torn line must not hide the records after it
+
+    # ── Log integrity (Routine Supervised v1.0: LOG-001 fail-closed readiness) ──
+
+    # A line longer than this is treated as malformed without parsing (bounded scan: no pathological
+    # single-line allocation can stall the integrity gate).
+    MAX_LINE_BYTES = 10_000_000
+    # The scan reports at most this many bad lines in detail (bounded output; the count is still exact).
+    MAX_BAD_LINE_DETAIL = 50
+
+    ACCEPT_ACTIVITY = "log_damage_accepted"
+
+    def scan_integrity(self) -> dict:
+        """Structurally validate the ENTIRE current log and report an explicit integrity state.
+
+        Returns ``{"status", "total_lines", "valid_records", "bad_lines", "unaccepted", "accepted"}``
+        where ``status`` is:
+
+        * ``"ok"``      — every non-empty line parses as a JSON object;
+        * ``"accepted_damage"`` — malformed line(s) exist but EVERY one is covered by an explicit
+          ``log_damage_accepted`` record (owner-recorded resolution; see
+          ``scripts/accept_prov_damage.py``). Destructive work may proceed; the damage stays visible.
+        * ``"blocked"`` — at least one malformed line has no acceptance record. Destructive operations
+          must refuse (LOG-001: malformed state blocks rather than silently omitting evidence).
+
+        Each bad line is identified by ``(line_no, sha256(raw bytes))`` — stable in an append-only file.
+        ``at_eof`` distinguishes a torn tail (crash mid-append; the common benign shape) from mid-file
+        damage. This is deliberately NOT a cryptographic claim (LOG-003): in the supervised single-
+        principal deployment the acceptance record is same-principal-writable; it provides visibility
+        and an audit trail, not authentication.
+        """
+        bad: list = []
+        accepted_marks: set = set()
+        total = 0
+        valid = 0
+        if not self.prov_path.exists():
+            return {"status": "ok", "total_lines": 0, "valid_records": 0,
+                    "bad_lines": [], "unaccepted": [], "accepted": []}
+        with open(self.prov_path, "rb") as f:
+            raw_lines = f.read().split(b"\n")
+        # split() yields a final "" element when the file ends with a newline; drop it.
+        if raw_lines and raw_lines[-1] == b"":
+            raw_lines.pop()
+        n_lines = len(raw_lines)
+        for idx, raw in enumerate(raw_lines, start=1):
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            total += 1
+            rec = None
+            if len(stripped) <= self.MAX_LINE_BYTES:
+                try:
+                    rec = json.loads(stripped.decode("utf-8", errors="strict"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    rec = None
+            if isinstance(rec, dict):
+                valid += 1
+                if rec.get("activity") == self.ACCEPT_ACTIVITY:
+                    p = rec.get("params") or {}
+                    accepted_marks.add((p.get("line_no"), p.get("line_sha256")))
+                continue
+            if len(bad) < self.MAX_BAD_LINE_DETAIL:
+                bad.append({
+                    "line_no": idx,
+                    "line_sha256": sha256_hex(stripped),
+                    "preview": stripped[:120].decode("utf-8", errors="replace"),
+                    "at_eof": idx == n_lines,
+                    "reason": ("oversized" if len(stripped) > self.MAX_LINE_BYTES else "malformed"),
+                })
+        unaccepted = [b for b in bad if (b["line_no"], b["line_sha256"]) not in accepted_marks]
+        accepted = [b for b in bad if (b["line_no"], b["line_sha256"]) in accepted_marks]
+        status = "ok" if not bad else ("accepted_damage" if not unaccepted else "blocked")
+        return {"status": status, "total_lines": total, "valid_records": valid,
+                "bad_lines": bad, "unaccepted": unaccepted, "accepted": accepted}
+
+    def accept_log_damage(self, line_no: int, line_sha256: str, *, note: str,
+                          operator: str = "owner") -> dict:
+        """Record the owner's explicit resolution of ONE malformed log line, identified exactly by
+        ``(line_no, sha256)``. Intended to be invoked out-of-band via ``scripts/accept_prov_damage.py``
+        after human inspection — it is intentionally NOT exposed as an MCP tool, so the agent workflow
+        cannot casually self-acknowledge damage. The damaged line is never rewritten or removed
+        (append-only store); it simply stops blocking readiness while remaining permanently visible in
+        every future ``scan_integrity`` report."""
+        if not note or not note.strip():
+            raise ValueError("accept_log_damage requires a non-empty human note")
+        return self.record(
+            activity=self.ACCEPT_ACTIVITY,
+            agent=operator,
+            params={"line_no": int(line_no), "line_sha256": line_sha256, "note": note},
+        )
 
     def query(self, item_key: str) -> list[dict]:
         """All PROV records for a given item, in append order (the basis for ``query_provenance``)."""
