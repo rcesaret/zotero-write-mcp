@@ -21,8 +21,8 @@ from zotero_write_mcp import __version__
 from zotero_write_mcp.gateway import ConcurrencyConflictError, library_prefix
 from zotero_write_mcp.merge import (
     ClusterSnapshot, RestoreReport, build_cluster, cluster_snapshot_from_dict, compute_merge_projection,
-    rollback_merge, verify_merge, _as_list, _citekey_from_extra, _is_empty, _is_trashed, _master_overrides,
-    _unwrap, _zotero_tags,
+    rollback_merge, verify_merge, _as_list, _citekey_from_extra, _is_empty, _is_trashed, _master_differs,
+    _master_overrides, _unwrap, _zotero_tags,
 )
 from zotero_write_mcp.observability import observability_is_fresh
 from zotero_write_mcp.provenance import ProvenanceStore
@@ -441,30 +441,133 @@ def find_orphan_commit_intents(prov: ProvenanceStore) -> list:
             and r.get("was_derived_from") not in reconciled]
 
 
+def master_inversion_provable(snapshot: ClusterSnapshot, observed: ClusterSnapshot, *,
+                              library_base: str, smart_fill: bool = False,
+                              field_sources: Optional[dict] = None) -> tuple:
+    """Whether reverting the master to its snapshot state is provably non-destructive (Routine
+    Supervised v1.0, CON-003). True only when the observed master state is fully explained WITHOUT a
+    concurrent edit: either it still equals the snapshot (nothing to revert), or it equals exactly what
+    the engine's own merge projection would have written. Any third state means an external writer may
+    have touched the master since the snapshot — a snapshot revert could then overwrite that edit, so
+    the caller must skip the master revert and route to human recovery. Returns ``(bool, reason)``."""
+    m = snapshot.master_key
+    obs_m = observed.items.get(m)
+    if obs_m is None:
+        return False, "master-absent"
+    sm = snapshot.items[m]
+    if not _master_differs(sm, obs_m):
+        return True, "master-unchanged"
+    proj_m = compute_merge_projection(snapshot, smart_fill=smart_fill, library_base=library_base,
+                                      field_sources=field_sources).items[m]
+    same_as_projection = (
+        set(obs_m.collections) == set(proj_m.collections)
+        and {tuple(t) for t in obs_m.tags} == {tuple(t) for t in proj_m.tags}
+        and {p: set(_as_list(v)) for p, v in obs_m.relations.items()}
+            == {p: set(_as_list(v)) for p, v in proj_m.relations.items()}
+        and all(obs_m.fields.get(k) == v for k, v in proj_m.fields.items() if not _is_empty(v))
+        and all(_is_empty(v) or k in proj_m.fields for k, v in obs_m.fields.items())
+    )
+    if same_as_projection:
+        return True, "matches-engine-projection"
+    return False, "unexplained-master-state"
+
+
 def reconcile_orphan_commits(prov: ProvenanceStore, reader: Any, gateway: Any, *,
                              library_id: int, library_type: str = "user") -> list:
     """F4 crash-recovery: roll back every orphaned commit_merge_intent. Reconstructs the snapshot from its
     ``snapshot_cluster`` PROV before-image blob (ADR-008: snapshot_id IS the rollback index), re-reads the
-    live cluster, runs ``rollback_merge``, and records a ``commit_merge_reconciled`` PROV row. Returns the
-    per-orphan outcomes. Run at startup before resuming the merge chain."""
+    live cluster, runs ``rollback_merge``, and records the outcome. Run at startup before resuming the
+    merge chain.
+
+    Routine Supervised v1.0 recovery truthfulness (REC-003/004/005):
+
+    * a ``commit_merge_reconciled`` success marker is written ONLY when the rollback actually succeeded;
+      a failed rollback writes ``commit_merge_reconcile_failed`` instead, which does NOT resolve the
+      orphan — it stays in :func:`find_orphan_commit_intents` and :func:`unresolved_transactions` on
+      every later scan until a recovery attempt truly succeeds;
+    * each orphan is isolated: an exception while processing one (corrupt blob, reader failure) is
+      recorded as that orphan's ``error`` outcome and the scan continues to the next orphan;
+    * the master scalar revert runs only when :func:`master_inversion_provable` shows the live master
+      state is engine-authored — otherwise it is skipped non-destructively and the orphan remains
+      unresolved (CON-003: recovery never restores an old snapshot over a possible concurrent edit).
+    """
     snap_blob = {r.get("was_derived_from"): (r.get("entity") or {}).get("before_blob")
                  for r in prov.all_records() if r.get("activity") == "snapshot_cluster"}
     outcomes: list = []
     for orphan in find_orphan_commit_intents(prov):
         sid = orphan.get("was_derived_from")
-        blob = snap_blob.get(sid)
-        if not blob:
-            outcomes.append({"snapshot_id": sid, "status": "no-snapshot-blob"})
-            continue
-        snapshot = cluster_snapshot_from_dict(prov.get_json_blob(blob))
-        observed = build_cluster(reader, snapshot.master_key, list(snapshot.secondary_keys))
-        rb = rollback_merge(snapshot, observed, gateway, library_id=library_id, library_type=library_type)
-        prov.record(activity="commit_merge_reconciled", item_key=snapshot.master_key, snapshot_id=sid,
-                    agent="merge-engine", tool_version=__version__,
-                    params={"rollback_ok": rb.ok, "failures": rb.failures})
-        outcomes.append({"snapshot_id": sid, "status": "reconciled" if rb.ok else "rollback_failed",
-                         "rollback": rb})
+        item_key = (orphan.get("entity") or {}).get("item_key")
+        oparams = orphan.get("params") or {}
+        try:
+            blob = snap_blob.get(sid)
+            if not blob:
+                outcomes.append({"snapshot_id": sid, "status": "no-snapshot-blob"})
+                continue
+            snapshot = cluster_snapshot_from_dict(prov.get_json_blob(blob))
+            observed = build_cluster(reader, snapshot.master_key, list(snapshot.secondary_keys))
+            allow_revert, revert_reason = master_inversion_provable(
+                snapshot, observed,
+                library_base=library_item_base(library_type, library_id),
+                smart_fill=bool(oparams.get("smart_fill")),
+                field_sources=oparams.get("field_sources"))
+            rb = rollback_merge(snapshot, observed, gateway, library_id=library_id,
+                                library_type=library_type, allow_master_revert=allow_revert)
+            if rb.ok:
+                prov.record(activity="commit_merge_reconciled", item_key=snapshot.master_key,
+                            snapshot_id=sid, agent="merge-engine", tool_version=__version__,
+                            params={"rollback_ok": True, "master_inversion": revert_reason})
+                outcomes.append({"snapshot_id": sid, "status": "reconciled", "rollback": rb})
+            else:
+                prov.record(activity="commit_merge_reconcile_failed", item_key=snapshot.master_key,
+                            snapshot_id=sid, agent="merge-engine", tool_version=__version__,
+                            params={"rollback_ok": False, "failures": rb.failures,
+                                    "master_inversion": revert_reason})
+                outcomes.append({"snapshot_id": sid, "status": "rollback_failed", "rollback": rb})
+        except Exception as e:                       # REC-004: one bad orphan must not hide the rest
+            err = f"{type(e).__name__}: {e}"
+            try:
+                prov.record(activity="commit_merge_reconcile_failed", item_key=item_key,
+                            snapshot_id=sid, agent="merge-engine", tool_version=__version__,
+                            params={"rollback_ok": False, "error": err})
+            except Exception:
+                pass                                 # recording must not mask the outcome below
+            outcomes.append({"snapshot_id": sid, "status": "error", "error": err})
     return outcomes
+
+
+def unresolved_transactions(prov: ProvenanceStore) -> list:
+    """Every transaction whose recovery state is NOT cleanly resolved (Routine Supervised v1.0,
+    REC-003/REC-006). Sources:
+
+    * orphaned ``commit_merge_intent`` records — no ``commit_merge`` result and no SUCCESSFUL
+      ``commit_merge_reconciled`` (a ``commit_merge_reconcile_failed`` does not resolve);
+    * ``merge_txn_unresolved`` records with no later ``merge_txn_resolved`` for the same
+      transaction id (the production transaction layer's explicit unresolved terminal state).
+
+    Readiness and the production merge transaction both consult this: while it is non-empty, every
+    destructive Routine Supervised v1.0 operation refuses.
+    """
+    out: list = []
+    for orphan in find_orphan_commit_intents(prov):
+        out.append({"kind": "orphan_commit_intent",
+                    "snapshot_id": orphan.get("was_derived_from"),
+                    "item_key": (orphan.get("entity") or {}).get("item_key"),
+                    "ts": orphan.get("ts")})
+    resolved_txn = set()
+    unresolved_txn: dict = {}
+    for r in prov.iter_records():
+        act = r.get("activity")
+        if act == "merge_txn_resolved":
+            resolved_txn.add((r.get("params") or {}).get("transaction_id"))
+        elif act == "merge_txn_unresolved":
+            tid = (r.get("params") or {}).get("transaction_id")
+            if tid:
+                unresolved_txn[tid] = r
+    for tid, r in unresolved_txn.items():
+        if tid not in resolved_txn:
+            out.append({"kind": "unresolved_transaction", "transaction_id": tid,
+                        "item_key": (r.get("entity") or {}).get("item_key"), "ts": r.get("ts")})
+    return out
 
 
 # ── live reader + snapshot loader (for the MCP tool layer) ──────────────────────

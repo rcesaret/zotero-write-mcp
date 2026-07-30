@@ -734,6 +734,7 @@ def rollback_merge(
     *,
     library_id: int,
     library_type: str = "user",
+    allow_master_revert: bool = True,
 ) -> RestoreReport:
     """Undo a merge from the snapshot, handling all 3 partial states (Stage-E C-2):
 
@@ -745,6 +746,14 @@ def rollback_merge(
 
     Versions for each PATCH come from the OBSERVED (current) state. Pure orchestration over the
     injected gateway — deterministic and unit-testable with a fake gateway.
+
+    ``allow_master_revert`` (Routine Supervised v1.0, CON-003/CON-004): the master scalar revert
+    restores the SNAPSHOT state over whatever the master currently holds. That is only provably safe
+    when the current master state is explained by the engine's own merge (recovery callers establish
+    this via :func:`~zotero_write_mcp.merge_live.master_inversion_provable`). When False and the
+    master differs from the snapshot, the revert op is SKIPPED and recorded as a failure — a
+    non-destructive stop that routes to human recovery instead of overwriting a possible concurrent
+    edit. Un-trash and re-parent ops still run: they restore engine-authored state transitions.
     """
     m = snapshot.master_key
     sm = snapshot.items[m]
@@ -793,7 +802,13 @@ def rollback_merge(
             lambda k=k: gateway.create_items(library_id, [snapshot.items[k].json], library_type=library_type))
 
     # (b) revert master scalar/array fields, then re-parent children to their original parents
-    if obs_m is not None and master_changed:
+    if obs_m is not None and master_changed and not allow_master_revert:
+        # CON-003: the caller could not prove the current master state is engine-authored, so a
+        # snapshot revert could overwrite a concurrent edit. Refuse THIS op only, loudly (ok=False).
+        failures.append({"op": "revert-master", "key": m,
+                         "error": "skipped: master state not provably engine-authored "
+                                  "(possible concurrent edit) — human recovery required"})
+    elif obs_m is not None and master_changed:
         revert = {**sm.fields, "collections": sm.collections,
                   "tags": _zotero_tags(sm.tags), "relations": sm.relations}
         # Clear any scalar field the merge ADDED to the master (present in observed, absent in the snapshot

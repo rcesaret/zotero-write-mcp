@@ -136,7 +136,10 @@ def test_readiness_report_verdicts_true_when_all_pass(tmp_path, monkeypatch):
     daily_report(prov, ts=(now - timedelta(hours=1)).isoformat())
     monkeypatch.setattr(httpx, "get", lambda *a, **k: _FakeResponse(200))
     rep = readiness.readiness_report(prov, probe_local_api=True)
-    assert len(rep["rows"]) == 5
+    # Routine Supervised v1.0 added two rows (log_integrity, unresolved_transactions): 5 -> 7.
+    # This is a STRENGTHENING change — the all-pass verdict now additionally requires a structurally
+    # clean PROV log and zero unresolved transactions (both true on this fresh fixture).
+    assert len(rep["rows"]) == 7
     assert rep["live_merge_safe_now"] is True
     # live_create_safe_now depends on the fast fake response's near-zero elapsed time
     assert rep["live_create_safe_now"] is True
@@ -152,5 +155,6 @@ def test_readiness_report_merge_unsafe_when_observability_stale(tmp_path, monkey
 def test_readiness_report_skips_local_api_probe_when_disabled(tmp_path):
     prov = ProvenanceStore(tmp_path)
     rep = readiness.readiness_report(prov, probe_local_api=False)
-    assert len(rep["rows"]) == 4
+    # v1 added log_integrity + unresolved_transactions rows: 4 -> 6 without the local-API probe.
+    assert len(rep["rows"]) == 6
     assert rep["live_create_safe_now"] is None

@@ -17,7 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from zotero_write_mcp.merge_live import ENABLE_ENV, ENABLE_TOKEN, DEFAULT_FRESHNESS_WINDOW
+from zotero_write_mcp.merge_live import (ENABLE_ENV, ENABLE_TOKEN, DEFAULT_FRESHNESS_WINDOW,
+                                         unresolved_transactions)
 from zotero_write_mcp.observability import latest_daily_report, observability_is_fresh
 from zotero_write_mcp.provenance import ProvenanceStore
 
@@ -76,6 +77,48 @@ def prov_store_row(prov: ProvenanceStore) -> dict:
         "detail": (f"PROV store writable at {prov.root} ({prov.count()} records)." if writable else
                   f"PROV store at {prov.root} is NOT writable — every mutation here "
                   "would be unrollbackable."),
+    }
+
+
+def log_integrity_row(prov: ProvenanceStore) -> dict:
+    """Routine Supervised v1.0 LOG-001: the PROV log must be structurally readable through its current
+    end before any destructive work. A malformed or torn line that the owner has not explicitly
+    accepted (scripts/accept_prov_damage.py) fails this row closed."""
+    report = prov.scan_integrity()
+    ok = report["status"] in ("ok", "accepted_damage")
+    return {
+        "row": "log_integrity",
+        "status": "pass" if ok else "fail",
+        "integrity_status": report["status"],
+        "valid_records": report["valid_records"],
+        "bad_lines": [{"line_no": b["line_no"], "sha256": b["line_sha256"], "at_eof": b["at_eof"],
+                       "reason": b["reason"]} for b in report["bad_lines"]],
+        "detail": (f"PROV log integrity: {report['status']} "
+                   f"({report['valid_records']} valid records"
+                   + (f", {len(report['accepted'])} accepted damaged line(s) still visible" if report["accepted"] else "")
+                   + ")."
+                   if ok else
+                   f"PROV log integrity BLOCKED: {len(report['unaccepted'])} unaccepted damaged line(s). "
+                   "Inspect and resolve with scripts/accept_prov_damage.py before any destructive work."),
+    }
+
+
+def unresolved_transactions_row(prov: ProvenanceStore) -> dict:
+    """Routine Supervised v1.0 REC-006: while any transaction's recovery state is unresolved (an
+    orphaned commit intent, a failed reconcile, or an explicit merge_txn_unresolved), every destructive
+    operation must refuse. Names the unresolved identifiers and the operator resolution path."""
+    unresolved = unresolved_transactions(prov)
+    return {
+        "row": "unresolved_transactions",
+        "status": "pass" if not unresolved else "fail",
+        "count": len(unresolved),
+        "unresolved": unresolved,
+        "detail": ("No unresolved transactions." if not unresolved else
+                   f"{len(unresolved)} unresolved transaction(s) BLOCK all destructive operations: "
+                   + "; ".join(f"{u['kind']}:{u.get('transaction_id') or u.get('snapshot_id')}"
+                               for u in unresolved)
+                   + ". Resolve via reconcile_orphans / the recovery runbook; a failed rollback "
+                     "requires human recovery and stays listed until a later attempt succeeds."),
     }
 
 
@@ -175,6 +218,8 @@ def readiness_report(prov: ProvenanceStore, *, probe_local_api: bool = True) -> 
         observability_freshness_row(prov),
         prov_store_row(prov),
         engine_version_skew_row(),
+        log_integrity_row(prov),                  # v1 LOG-001: malformed PROV state fails closed
+        unresolved_transactions_row(prov),        # v1 REC-006: unresolved recovery blocks destructive ops
     ]
     if probe_local_api:
         rows.append(local_api_latency_row())
@@ -182,6 +227,8 @@ def readiness_report(prov: ProvenanceStore, *, probe_local_api: bool = True) -> 
     live_merge_safe_now = (
         by_row["observability_freshness"]["status"] == "pass"
         and by_row["prov_store"]["status"] == "pass"
+        and by_row["log_integrity"]["status"] == "pass"
+        and by_row["unresolved_transactions"]["status"] == "pass"
     )
     live_create_safe_now = None
     if probe_local_api:
