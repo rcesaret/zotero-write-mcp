@@ -31,6 +31,9 @@ from zotero_write_mcp.merge_txn import (
     propose_merge_txn as _eng_propose_txn, execute_merge_txn as _eng_execute_txn,
     reconcile_orphan_txns as _eng_reconcile_txns,
 )
+from zotero_write_mcp.metadata import (
+    propose_metadata_update as _eng_propose_meta, apply_metadata_update as _eng_apply_meta,
+)
 from zotero_write_mcp import _release as _eng_release
 from zotero_write_mcp.dedup import dedup_scan as _eng_dedup
 from zotero_write_mcp.observability import (
@@ -358,28 +361,40 @@ def update_item_fields(
     item_key: str,
     fields: dict,
 ) -> str:
-    """Update specific fields on an existing Zotero item.
+    """RETIRED for Routine Supervised v1.0 (PRD META-001/002/003). This tool accepted ANY field —
+    including `extra`, which carries the pinned BBT citation-key identity — with no allowlist, no
+    preview, and no proposal-bound version check. Metadata changes now run as a separate reviewed
+    operation. This stub refuses before any client call."""
+    return json.dumps({
+        "error": "update_item_fields is RETIRED on the production surface. Use the reviewed "
+                 "metadata operation instead: 1) propose_metadata_update(item_key, changes) -> the "
+                 "owner reviews the exact field-by-field preview; 2) apply_metadata_update("
+                 "proposal_id) — engine-owned live-version check, explicit bibliographic allowlist "
+                 "(identity/structural/state/unknown fields are rejected), conflict blocks without "
+                 "overwriting. Tag changes: add_tags_to_item / remove_tags_from_item."})
 
-    Args:
-        item_key: The Zotero item key (e.g. "BCBLBCMI")
-        fields: Dictionary of field names and new values.
-                Supported fields include: title, date, publicationTitle, volume,
-                issue, pages, DOI, publisher, place, url, abstractNote, ISBN,
-                ISSN, bookTitle, edition, series, extra, rights, language, etc.
-                For creators, pass a full creators array.
-                For tags, pass a list of {"tag": "name"} dicts.
-    """
+
+@mcp.tool()
+def propose_metadata_update(item_key: str, changes: dict) -> str:
+    """Routine Supervised v1.0: READ-ONLY preview of one metadata update (META-001). Rejects
+    identity/structural/state/unknown fields before anything else (META-002); captures the live
+    version; records an immutable proposal content-bound to (item, version, changes). Present the
+    field-by-field preview to the owner; only their approval authorizes apply_metadata_update."""
     zot = get_client()
-    item = zot.get_item_web(item_key)  # web read for current version
-    version = item.get("version", item.get("data", {}).get("version"))
-    data = item.get("data", item)
+    reader = WebClusterReader(zot, zot.library_id)
+    return json.dumps(_eng_propose_meta(reader, zot.prov, item_key, changes), default=str)
 
-    # Update fields
-    for k, v in fields.items():
-        data[k] = v
 
-    result = zot.update_item(item_key, data, version)
-    return f"✅ Updated item {item_key}. Fields changed: {', '.join(fields.keys())}"
+@mcp.tool()
+def apply_metadata_update(proposal_id: str) -> str:
+    """Routine Supervised v1.0: apply ONE owner-approved metadata proposal (META-002/003). The
+    engine re-checks the live version immediately before the PATCH — any change since preview
+    blocks WITHOUT overwriting the live value. Shadow unless the supervised live window is open.
+    Relay the structured result verbatim (IDEM-003)."""
+    zot = get_client()
+    reader = WebClusterReader(zot, zot.library_id)
+    return json.dumps(_eng_apply_meta(proposal_id, reader, zot.gateway, zot.prov,
+                                      library_id=zot.library_id), default=str)
 
 
 @mcp.tool()
