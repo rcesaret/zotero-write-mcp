@@ -80,6 +80,21 @@ def prov_store_row(prov: ProvenanceStore) -> dict:
     }
 
 
+def create_policy_row() -> dict:
+    """Routine Supervised v1.0 SCOPE-004: auto-create is OFF in both controlled-pilot and routine
+    modes. The engine ships no unattended create path — create tools execute only inside the
+    hook-gated, human-reviewed ingest workflow, which is outside the v1 release. This row states
+    that policy so every readiness report carries the create posture explicitly."""
+    return {
+        "row": "create_policy",
+        "status": "pass",
+        "auto_create": "disabled",
+        "detail": ("Auto-create is DISABLED for Routine Supervised v1.0 (SCOPE-004). No v1 workflow "
+                   "issues a create call; the create/ingest path is a separate v1.1 capability with "
+                   "its own gates."),
+    }
+
+
 def log_integrity_row(prov: ProvenanceStore) -> dict:
     """Routine Supervised v1.0 LOG-001: the PROV log must be structurally readable through its current
     end before any destructive work. A malformed or torn line that the owner has not explicitly
@@ -220,6 +235,7 @@ def readiness_report(prov: ProvenanceStore, *, probe_local_api: bool = True) -> 
         engine_version_skew_row(),
         log_integrity_row(prov),                  # v1 LOG-001: malformed PROV state fails closed
         unresolved_transactions_row(prov),        # v1 REC-006: unresolved recovery blocks destructive ops
+        create_policy_row(),                      # v1 SCOPE-004: auto-create posture stated explicitly
     ]
     if probe_local_api:
         rows.append(local_api_latency_row())

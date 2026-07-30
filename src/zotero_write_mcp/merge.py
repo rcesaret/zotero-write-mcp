@@ -516,7 +516,11 @@ def verify_merge(
     if smart_fill:
         for _sk in sec_keys:
             for _fk, _fv in snapshot.items[_sk].fields.items():
-                if _fk not in _PROTECTED_FIELDS and _is_empty(expected_fields.get(_fk)) and not _is_empty(_fv):
+                # Central admissibility applies to EVERY producer (MRG-003): smart_fill previously
+                # filtered only _PROTECTED_FIELDS, so a trashed secondary's `deleted` (empty on a
+                # live master) qualified as a "fillable" scalar — the F2 mechanism via this producer.
+                if (_fk not in _PROTECTED_FIELDS and _fk not in _UNRECONCILABLE_FIELDS
+                        and _is_empty(expected_fields.get(_fk)) and not _is_empty(_fv)):
                     expected_fields[_fk] = _fv
     expected_fields.update(overrides)
     changed, added = [], []
@@ -662,7 +666,10 @@ def compute_merge_projection(
     if smart_fill:
         for it in sec:
             for k, v in it.fields.items():
-                if k not in _PROTECTED_FIELDS and _is_empty(fields.get(k)) and not _is_empty(v):
+                # Same central admissibility as verify's expectation (MRG-003): structure/state is
+                # not metadata and may never be produced by scalar fill.
+                if (k not in _PROTECTED_FIELDS and k not in _UNRECONCILABLE_FIELDS
+                        and _is_empty(fields.get(k)) and not _is_empty(v)):
                     fields[k] = v
     fields.update(_master_overrides(snapshot, field_sources))   # Phase B: enrichment + citekey-alias accumulation
 

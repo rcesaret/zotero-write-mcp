@@ -94,9 +94,14 @@ def merge_cluster(
     if smart_fill:
         # M-2: fill a master field only if it is empty in BOTH the snapshot AND the LIVE master, so a
         # value populated after the snapshot is never overwritten (version-drift abort backs this up).
+        # Defense in depth (MRG-003): the projection already refuses structure/state, but this PATCH
+        # producer re-checks so no future projection change can leak `deleted`/`itemType`/etc. here.
+        from zotero_write_mcp.merge import _UNRECONCILABLE_FIELDS
         snap_fields = snapshot.items[m].fields
         live = fresh_data[m]
         for k, v in pm.fields.items():
+            if k in _UNRECONCILABLE_FIELDS:
+                continue
             if _is_empty(snap_fields.get(k)) and not _is_empty(v) and _is_empty(live.get(k)):
                 master_data[k] = v
     # Phase B: apply the owner-approved field-level enrichment AND citekey-alias accumulation. The override

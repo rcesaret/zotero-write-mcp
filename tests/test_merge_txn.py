@@ -466,6 +466,17 @@ def test_crash_recovery_with_concurrent_edit_stays_unresolved(tmp_path, monkeypa
     assert TXN_UNRESOLVED in acts
 
 
+def test_no_purge_path_in_transaction_source():
+    """§5.3 #14 static half: the transaction layer contains no delete/purge call at all — trash is
+    the only removal verb (PATCH deleted:1). The dynamic half is enforced in every test above by
+    FakeLibrary.delete_items raising."""
+    import pathlib
+    import zotero_write_mcp.merge_txn as mt
+    src = pathlib.Path(mt.__file__).read_text(encoding="utf-8")
+    assert "delete_items" not in src
+    assert '"deleted": 1' in src
+
+
 def test_blocked_txn_is_not_an_orphan(tmp_path, live):
     """A blocked_before_write terminal record resolves the intent bookkeeping — it must not linger
     as a phantom unresolved transaction."""
