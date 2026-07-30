@@ -542,10 +542,13 @@ def unresolved_transactions(prov: ProvenanceStore) -> list:
     * orphaned ``commit_merge_intent`` records — no ``commit_merge`` result and no SUCCESSFUL
       ``commit_merge_reconciled`` (a ``commit_merge_reconcile_failed`` does not resolve);
     * ``merge_txn_unresolved`` records with no later ``merge_txn_resolved`` for the same
-      transaction id (the production transaction layer's explicit unresolved terminal state).
+      transaction id (the production transaction layer's explicit unresolved terminal state);
+    * orphaned ``merge_txn_intent`` records — a transaction-layer crash before ANY terminal record
+      (result / rolled_back / unresolved) was written.
 
     Readiness and the production merge transaction both consult this: while it is non-empty, every
-    destructive Routine Supervised v1.0 operation refuses.
+    destructive Routine Supervised v1.0 operation refuses. (Transaction-layer activity names are
+    string literals here to avoid a merge_live<->merge_txn import cycle; merge_txn.py owns them.)
     """
     out: list = []
     for orphan in find_orphan_commit_intents(prov):
@@ -553,19 +556,32 @@ def unresolved_transactions(prov: ProvenanceStore) -> list:
                     "snapshot_id": orphan.get("was_derived_from"),
                     "item_key": (orphan.get("entity") or {}).get("item_key"),
                     "ts": orphan.get("ts")})
+    txn_terminal_acts = {"merge_txn_result", "merge_txn_rolled_back", "merge_txn_unresolved",
+                         "merge_txn_shadow", "merge_txn_blocked"}
     resolved_txn = set()
     unresolved_txn: dict = {}
+    txn_terminal_ids: set = set()
+    txn_intents: dict = {}
     for r in prov.iter_records():
         act = r.get("activity")
+        tid = (r.get("params") or {}).get("transaction_id")
         if act == "merge_txn_resolved":
-            resolved_txn.add((r.get("params") or {}).get("transaction_id"))
+            resolved_txn.add(tid)
         elif act == "merge_txn_unresolved":
-            tid = (r.get("params") or {}).get("transaction_id")
             if tid:
                 unresolved_txn[tid] = r
+        elif act == "merge_txn_intent":
+            if tid:
+                txn_intents[tid] = r
+        if act in txn_terminal_acts and tid:
+            txn_terminal_ids.add(tid)
     for tid, r in unresolved_txn.items():
         if tid not in resolved_txn:
             out.append({"kind": "unresolved_transaction", "transaction_id": tid,
+                        "item_key": (r.get("entity") or {}).get("item_key"), "ts": r.get("ts")})
+    for tid, r in txn_intents.items():
+        if tid not in txn_terminal_ids:
+            out.append({"kind": "orphan_txn_intent", "transaction_id": tid,
                         "item_key": (r.get("entity") or {}).get("item_key"), "ts": r.get("ts")})
     return out
 

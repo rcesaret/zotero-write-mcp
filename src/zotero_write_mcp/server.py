@@ -24,7 +24,14 @@ from zotero_write_mcp.merge import (
 from zotero_write_mcp.merge_live import (
     merge_cluster as _eng_merge, commit_merge as _eng_commit, load_snapshot as _eng_load_snapshot,
     reconcile_orphan_commits as _eng_reconcile, WebClusterReader, library_item_base,
+    master_inversion_provable as _eng_master_inversion, unresolved_transactions as _eng_unresolved,
 )
+# Routine Supervised v1.0: the ONE production merge transaction (PRD MRG-005/CON-001) + release identity.
+from zotero_write_mcp.merge_txn import (
+    propose_merge_txn as _eng_propose_txn, execute_merge_txn as _eng_execute_txn,
+    reconcile_orphan_txns as _eng_reconcile_txns,
+)
+from zotero_write_mcp import _release as _eng_release
 from zotero_write_mcp.dedup import dedup_scan as _eng_dedup
 from zotero_write_mcp.observability import (
     query_provenance as _eng_query_prov, daily_report as _eng_daily,
@@ -86,9 +93,16 @@ def _run_startup_reconcile(zot: ZoteroClient) -> dict:
         outcomes = _eng_reconcile(zot.prov, reader, zot.gateway, library_id=zot.library_id)
         summary["orphans_found"] = len(outcomes)
         summary["reconciled"] = sum(1 for o in outcomes if o.get("status") == "reconciled")
-        summary["rollback_failed"] = sum(1 for o in outcomes if o.get("status") == "rollback_failed")
+        summary["rollback_failed"] = sum(1 for o in outcomes
+                                         if o.get("status") in ("rollback_failed", "error"))
         summary["no_snapshot_blob"] = [o.get("snapshot_id") for o in outcomes
                                        if o.get("status") == "no-snapshot-blob"]
+        # Routine Supervised v1.0: transaction-layer crash recovery runs at startup too; anything it
+        # cannot cleanly roll back stays unresolved and blocks destructive work (REC-003/006).
+        txn_outcomes = _eng_reconcile_txns(zot.prov, reader, zot.gateway, library_id=zot.library_id)
+        summary["txn_orphans_found"] = len(txn_outcomes)
+        summary["rollback_failed"] += sum(1 for o in txn_outcomes
+                                          if o.get("status") in ("unresolved", "error"))
     except Exception as e:                       # never let recovery brick the server
         summary["error"] = f"{type(e).__name__}: {e}"
     if summary["no_snapshot_blob"] or summary["rollback_failed"] or summary["error"]:
@@ -926,64 +940,93 @@ def snapshot_cluster(master_key: str, dup_keys: list) -> str:
 
 
 @mcp.tool()
-def merge_cluster(master_key: str, dup_keys: list, snapshot_id: str, smart_fill: bool = False,
-                  field_sources: Optional[dict] = None) -> str:
-    """PATCH phase of a merge: reparent children to the master + union collections/tags/relations +
-    dc:replaces. NO delete — reversible via rollback_merge. Aborts with NO writes on version drift.
-
-    `field_sources` ({field: source_member_key}) is the owner-approved Phase-B field-level enrichment,
-    applied verbatim from the named member and enforced by verify check #3 (a wrong value fails the gate,
-    not the library). The returned `master_version` is the POST-PATCH master version — pass it into
-    commit_merge's `expected_master_version` to pin the master across the merge_cluster→commit window."""
-    zot = get_client()
-    snap = _eng_load_snapshot(zot.prov, snapshot_id)
-    if snap is None:
-        return json.dumps({"error": f"unknown snapshot_id {snapshot_id}; call snapshot_cluster first"})
-    reader = WebClusterReader(zot, zot.library_id)
-    plan = _eng_merge(snap, reader, zot.gateway, library_id=zot.library_id, smart_fill=smart_fill,
-                      field_sources=field_sources)
-    return json.dumps({"drifted": plan.drifted, "drift_keys": plan.drift_keys,
-                       "patches": plan.patches, "master_version": plan.master_version})
+def merge_cluster(master_key: str, dup_keys: list, snapshot_id: str) -> str:
+    """RETIRED for Routine Supervised v1.0 (PRD MRG-005/CON-001). The stepwise
+    snapshot->merge_cluster->commit_merge chain let the caller omit or alter the intermediate version
+    token and carried the smart_fill/field_sources enrichment surface. Production merges now run as ONE
+    engine-owned transaction. This stub refuses before any client/engine call."""
+    # RETIRED (Routine Supervised v1.0): refuse + redirect, mirroring the merge_items retirement.
+    return json.dumps({
+        "error": "merge_cluster is RETIRED on the production surface. Use the engine-owned "
+                 "transaction instead: 1) propose_merge_txn(master_key, dup_keys) -> owner reviews "
+                 "and approves the exact proposal; 2) execute_merge_txn(transaction_id). Version "
+                 "continuity, verification, trash, terminal verify, and recovery are engine-internal "
+                 "and cannot be omitted. There is no smart_fill and no field_sources; metadata "
+                 "enrichment is a separate reviewed update operation."})
 
 
 @mcp.tool()
-def commit_merge(master_key: str, snapshot_id: str, smart_fill: bool = False,
-                 field_sources: Optional[dict] = None, expected_master_version: Optional[int] = None) -> str:
-    """Verify-gated commit: re-run the 11-check verify against the live post-PATCH state, then TRASH the
-    secondaries (PATCH deleted:1, NEVER purge). SHADOW by default — it only trashes when the out-of-band
-    env token ZOT_MERGE_LIVE_ENABLED is set AND observability is fresh AND the ceiling/disjointness gates
-    hold. Any post-verify failure routes to rollback_merge.
+def commit_merge(master_key: str, snapshot_id: str) -> str:
+    """RETIRED for Routine Supervised v1.0 (PRD MRG-005/CON-001) — see merge_cluster. The optional
+    expected_master_version parameter on this tool was exactly the 'default away version checking'
+    hazard CON-001 forbids. This stub refuses before any client/engine call."""
+    return json.dumps({
+        "error": "commit_merge is RETIRED on the production surface. Use propose_merge_txn + "
+                 "execute_merge_txn — the engine owns version continuity end-to-end and a concurrent "
+                 "edit stops the transaction before any trash."})
 
-    `field_sources` MUST match the merge_cluster call (verify check #3 enforces the projected survivor).
-    `expected_master_version` = the `master_version` merge_cluster returned; if the live master has
-    advanced past it (a concurrent edit landed in the merge_cluster→commit window) the commit fails closed
-    and rolls back rather than trashing on top of someone else's edit (review #7 concurrency pin). When
-    omitted (None) the pin is skipped — the Python live-apply driver passes it; the agent surface should
-    thread merge_cluster's returned master_version straight through."""
+
+@mcp.tool()
+def propose_merge_txn(master_key: str, dup_keys: list) -> str:
+    """Routine Supervised v1.0: READ-ONLY merge proposal (PRV-001). Fresh-reads the cluster, computes
+    the conservative projection (collections/tags/relations union + dc:replaces + citekey-alias
+    accumulation; NO scalar enrichment), and records an immutable proposal whose transaction_id is
+    derived from the exact member set AND versions — any later change to either voids the approval
+    (SCOPE-003). The embedded verify runs against the projection and is labeled non-authoritative
+    (PRV-002). Present the returned proposal to the owner; only their approval authorizes
+    execute_merge_txn with this transaction_id."""
     zot = get_client()
-    snap = _eng_load_snapshot(zot.prov, snapshot_id)
-    if snap is None:
-        return json.dumps({"error": f"unknown snapshot_id {snapshot_id}"})
     reader = WebClusterReader(zot, zot.library_id)
-    res = _eng_commit(snap, reader, zot.gateway, zot.prov, library_id=zot.library_id, smart_fill=smart_fill,
-                      field_sources=field_sources, expected_master_version=expected_master_version)
-    return json.dumps({"mode": res.mode, "reason": res.reason, "verify_passed": res.verify_passed,
-                       "trashed": res.trashed,
-                       "rollback_ok": (res.rollback.ok if res.rollback else None)})
+    proposal = _eng_propose_txn(reader, zot.prov, master_key, list(dup_keys),
+                                library_id=zot.library_id)
+    return json.dumps(proposal, default=str)
+
+
+@mcp.tool()
+def execute_merge_txn(transaction_id: str) -> str:
+    """Routine Supervised v1.0: execute ONE owner-approved merge transaction (MRG-005). The engine
+    performs fresh read, proposal/version validation, snapshot+intent, conservative PATCH, live
+    re-read + 11-check verify, trash (never purge), child re-assert, and terminal verify internally.
+    SHADOW unless the out-of-band ZOT_MERGE_LIVE_ENABLED token is set (MUT-002). Terminal states are
+    explicit: shadow | blocked_before_write | committed | rolled_back | unresolved |
+    already_committed (idempotent retry performs no second mutation, IDEM-001). Relay the structured
+    result VERBATIM — narration must not upgrade a non-committed state (IDEM-003)."""
+    zot = get_client()
+    reader = WebClusterReader(zot, zot.library_id)
+    res = _eng_execute_txn(transaction_id, reader, zot.gateway, zot.prov, library_id=zot.library_id)
+    return json.dumps(res.to_dict(), default=str)
+
+
+@mcp.tool()
+def engine_identity() -> str:
+    """Routine Supervised v1.0: read-only serving-build identity (DEP-002). Reports the package
+    version, release label, and a deterministic sha256 source digest of the running engine's own
+    Python sources. Session preflight (DEP-003) compares this against the reviewed release record —
+    a mismatch means the serving build is NOT the reviewed engine and no write workflow may proceed."""
+    return json.dumps(_eng_release.identity())
 
 
 @mcp.tool()
 def rollback_merge(snapshot_id: str) -> str:
     """Undo a merge from its snapshot: un-trash secondaries + revert the master + reparent children to
-    their original parents. `ok` is False if a restore op itself failed (escalate to human recovery)."""
+    their original parents. `ok` is False if a restore op itself failed (escalate to human recovery).
+
+    Routine Supervised v1.0 (CON-003): the master scalar revert runs only when the live master state
+    is provably engine-authored (equals the snapshot or the engine's own projection). Otherwise that
+    one op is skipped non-destructively and reported under `failures` — a possible concurrent edit is
+    never overwritten by an old snapshot."""
     zot = get_client()
     snap = _eng_load_snapshot(zot.prov, snapshot_id)
     if snap is None:
         return json.dumps({"error": f"unknown snapshot_id {snapshot_id}"})
     reader = WebClusterReader(zot, zot.library_id)
     observed = _eng_build(reader, snap.master_key, list(snap.secondary_keys))
-    rb = _eng_rollback(snap, observed, zot.gateway, library_id=zot.library_id)
-    return json.dumps({"state": rb.state, "ok": rb.ok, "operations": rb.operations, "failures": rb.failures})
+    allow_revert, revert_reason = _eng_master_inversion(
+        snap, observed, library_base=library_item_base("user", zot.library_id))
+    rb = _eng_rollback(snap, observed, zot.gateway, library_id=zot.library_id,
+                       allow_master_revert=allow_revert)
+    return json.dumps({"state": rb.state, "ok": rb.ok, "operations": rb.operations,
+                       "failures": rb.failures, "master_inversion": revert_reason})
 
 
 @mcp.tool()
@@ -997,17 +1040,27 @@ def reconcile_orphans() -> str:
     zot = get_client()
     reader = WebClusterReader(zot, zot.library_id)
     outcomes = _eng_reconcile(zot.prov, reader, zot.gateway, library_id=zot.library_id)
+    txn_outcomes = _eng_reconcile_txns(zot.prov, reader, zot.gateway, library_id=zot.library_id)
     no_blob = [o.get("snapshot_id") for o in outcomes if o.get("status") == "no-snapshot-blob"]
-    failed = [o.get("snapshot_id") for o in outcomes if o.get("status") == "rollback_failed"]
+    failed = [o.get("snapshot_id") for o in outcomes if o.get("status") in ("rollback_failed", "error")]
+    txn_failed = [o.get("transaction_id") for o in txn_outcomes
+                  if o.get("status") in ("unresolved", "error")]
+    still_unresolved = _eng_unresolved(zot.prov)
     alert = None
-    if no_blob or failed:
-        alert = (f"{len(no_blob)} orphan(s) have NO snapshot blob (non-recoverable) and "
-                 f"{len(failed)} rollback(s) failed — HUMAN REVIEW required")
+    if no_blob or failed or txn_failed or still_unresolved:
+        alert = (f"{len(no_blob)} orphan(s) have NO snapshot blob (non-recoverable), "
+                 f"{len(failed)} legacy rollback(s) failed, {len(txn_failed)} transaction "
+                 f"recover(ies) unresolved; {len(still_unresolved)} unresolved item(s) BLOCK all "
+                 "destructive operations — HUMAN REVIEW required")
     return json.dumps({
         "orphans_found": len(outcomes),
         "reconciled": sum(1 for o in outcomes if o.get("status") == "reconciled"),
         "rollback_failed": failed,
         "no_snapshot_blob": no_blob,
+        "txn_orphans_found": len(txn_outcomes),
+        "txn_rolled_back": sum(1 for o in txn_outcomes if o.get("status") == "rolled_back"),
+        "txn_unresolved": txn_failed,
+        "unresolved_transactions": still_unresolved,
         "alert": alert,
         "outcomes": [{"snapshot_id": o.get("snapshot_id"), "status": o.get("status")} for o in outcomes],
     })

@@ -70,6 +70,9 @@ def test_reconcile_orphans_tool_surfaces_no_snapshot_blob(monkeypatch):
     monkeypatch.setattr(server, "WebClusterReader", lambda c, lib: "READER")
     monkeypatch.setattr(server, "_eng_reconcile",
                         lambda *a, **k: [{"snapshot_id": "GHOST", "status": "no-snapshot-blob"}])
+    # v1: the tool additionally runs transaction-layer recovery + the unresolved scan; stub both.
+    monkeypatch.setattr(server, "_eng_reconcile_txns", lambda *a, **k: [])
+    monkeypatch.setattr(server, "_eng_unresolved", lambda prov: [])
     monkeypatch.setattr(server, "_client", None)
     out = json.loads(_tool_fn("reconcile_orphans")())
     assert out["orphans_found"] == 1
@@ -77,7 +80,47 @@ def test_reconcile_orphans_tool_surfaces_no_snapshot_blob(monkeypatch):
     assert out["alert"] and "human review" in out["alert"].lower()
 
 
-# ── C.4: field_sources + expected_master_version wired onto merge_cluster / commit_merge tools ─────
+# ── Routine Supervised v1.0: the stepwise merge chain is RETIRED from the MCP surface ─────────────
+# The former C.4 tests here asserted that field_sources / smart_fill / expected_master_version were
+# THREADED through merge_cluster/commit_merge. That capability was removed by the v1 PRD
+# (MRG-001/002: no enrichment on the destructive surface; CON-001: no optional version parameter),
+# so those tests' product requirement genuinely changed: they are replaced by refusal tests that
+# prove the retired stubs never reach the engine or the client at all.
+
+
+def test_merge_cluster_retired_refuses_before_any_client():
+    """The stub must refuse WITHOUT get_client() — no stub-out needed; a live call would fail loudly."""
+    out = json.loads(_tool_fn("merge_cluster")("M", ["S"], "SID"))
+    assert "RETIRED" in out["error"] and "propose_merge_txn" in out["error"]
+
+
+def test_commit_merge_retired_refuses_before_any_client():
+    out = json.loads(_tool_fn("commit_merge")("M", "SID"))
+    assert "RETIRED" in out["error"] and "execute_merge_txn" in out["error"]
+
+
+def test_retired_merge_tools_accept_no_enrichment_or_version_params():
+    """MRG-001/002 + CON-001 at the tool layer: the retired signatures no longer even carry
+    smart_fill / field_sources / expected_master_version."""
+    import inspect
+    for name in ("merge_cluster", "commit_merge"):
+        params = set(inspect.signature(_tool_fn(name)).parameters)
+        assert "smart_fill" not in params, name
+        assert "field_sources" not in params, name
+        assert not any("version" in p for p in params), name
+
+
+def test_v1_txn_tools_registered():
+    for name in ("propose_merge_txn", "execute_merge_txn", "engine_identity"):
+        assert hasattr(server, name), name
+
+
+def test_engine_identity_reports_release_and_digest():
+    out = json.loads(_tool_fn("engine_identity")())
+    assert out["release_label"]
+    assert len(out["source_digest"]) == 64
+    assert out["package_version"]
+
 
 def _stub_client(monkeypatch, lib_id=9):
     """Stub out the live client + reader + snapshot load + startup reconcile so a merge tool runs
@@ -93,47 +136,6 @@ def _stub_client(monkeypatch, lib_id=9):
     monkeypatch.setattr(server, "_eng_load_snapshot", lambda prov, sid: object())   # non-None snapshot
     monkeypatch.setattr(server, "_eng_reconcile", lambda *a, **k: [])               # startup no-op
     monkeypatch.setattr(server, "_client", None)
-
-
-def test_merge_cluster_threads_field_sources(monkeypatch):
-    captured = {}
-
-    class _Plan:
-        drifted, drift_keys, patches, master_version = False, [], [], 77
-
-    _stub_client(monkeypatch)
-    monkeypatch.setattr(server, "_eng_merge", lambda *a, **k: (captured.update(k) or _Plan()))
-    out = json.loads(_tool_fn("merge_cluster")("M", ["S"], "SID", smart_fill=True,
-                                               field_sources={"title": "S"}))
-    assert captured["field_sources"] == {"title": "S"}
-    assert captured["smart_fill"] is True
-    assert out["master_version"] == 77          # the version to feed commit_merge's expected_master_version
-
-
-def test_commit_merge_threads_field_sources_and_expected_version(monkeypatch):
-    captured = {}
-
-    class _Res:
-        mode, reason, verify_passed, trashed, rollback = "shadow", "", True, [], None
-
-    _stub_client(monkeypatch)
-    monkeypatch.setattr(server, "_eng_commit", lambda *a, **k: (captured.update(k) or _Res()))
-    _tool_fn("commit_merge")("M", "SID", field_sources={"date": "S"}, expected_master_version=77)
-    assert captured["field_sources"] == {"date": "S"}
-    assert captured["expected_master_version"] == 77
-
-
-def test_commit_merge_param_defaults_unchanged(monkeypatch):
-    captured = {}
-
-    class _Res:
-        mode, reason, verify_passed, trashed, rollback = "shadow", "", True, [], None
-
-    _stub_client(monkeypatch)
-    monkeypatch.setattr(server, "_eng_commit", lambda *a, **k: (captured.update(k) or _Res()))
-    _tool_fn("commit_merge")("M", "SID")
-    assert captured["field_sources"] is None
-    assert captured["expected_master_version"] is None
 
 
 # ── C.5: prune — linked-attach hard-refused at the engine; imported-only default ──────────────────
