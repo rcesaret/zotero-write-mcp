@@ -48,9 +48,11 @@ def main() -> int:
     if not args.note:
         ap.error("--accept requires --note explaining why the damage is accepted")
     line_no, sha = int(args.accept[0]), args.accept[1]
-    match = [b for b in report["bad_lines"]
-             if b["line_no"] == line_no and b["line_sha256"] == sha]
-    if not match:
+    # F-2: match against BOTH detail views — `unaccepted` prioritises still-blocking lines, so when
+    # damage exceeds the detail cap, successive accept-and-rescan rounds surface the remainder.
+    candidates = {(b["line_no"], b["line_sha256"]) for b in report["bad_lines"]} | \
+                 {(b["line_no"], b["line_sha256"]) for b in report["unaccepted"]}
+    if (line_no, sha) not in candidates:
         print(f"REFUSED: no damaged line at line_no={line_no} with sha256={sha}. "
               "Run without --accept to list the current damage.", file=sys.stderr)
         return 2

@@ -477,6 +477,80 @@ def test_no_purge_path_in_transaction_source():
     assert '"deleted": 1' in src
 
 
+def test_crashed_txn_orphan_survives_a_blocked_retry(tmp_path, live):
+    """Review finding F-1 (BLOCKER): a Gate-0 refusal of a RETRIED transaction id must never
+    resolve the crashed run's orphaned intent. Crash after the first writes land (transport failure
+    at the pre-trash re-read propagates), then retry the same tid: the retry is refused (REC-006),
+    and the orphan must STILL be discoverable, still reconcilable, still readiness-blocking, and
+    still blocking third-party transactions."""
+    lib = FakeLibrary(make_raw())
+    prov = ProvenanceStore(tmp_path / "p")
+    tid = _propose(lib, prov)["transaction_id"]
+
+    state = {"boom": False}
+    orig_get = lib.get_item
+    def flaky_get(key):
+        if state["boom"] and key == "M1":
+            raise ConnectionError("transport failure during pre-trash re-read")
+        return orig_get(key)
+    lib.get_item = flaky_get
+
+    def inject(op_index):
+        if op_index == 3:          # after patch-master + 2 reparents, before the re-read
+            lib.after_write_hook = None
+            state["boom"] = True
+    lib.after_write_hook = inject
+
+    with pytest.raises(ConnectionError):
+        _execute(tid, lib, prov)
+    state["boom"] = False          # transport restored; process is still alive (no startup reconcile)
+
+    # The crash left an orphaned intent with landed writes.
+    assert any(u.get("transaction_id") == tid for u in unresolved_transactions(prov))
+
+    # The natural next act: retry the same transaction id. It must be refused...
+    res2 = _execute(tid, lib, prov)
+    assert res2.state == "blocked_before_write"
+    # ...and the refusal must NOT have laundered the orphan away:
+    assert any(u.get("transaction_id") == tid for u in unresolved_transactions(prov)), \
+        "F-1: the blocked retry erased the crashed run's unresolved state"
+    # A third-party transaction is still blocked (REC-006)...
+    raw2 = make_raw()
+    tid3 = _propose(lib, prov)["transaction_id"]  # same cluster; id differs (versions moved)
+    res3 = _execute(tid3, lib, prov)
+    assert res3.state == "blocked_before_write" and "unresolved" in res3.reason
+    # ...and recovery still finds and repairs the orphan.
+    outcomes = reconcile_orphan_txns(prov, lib, lib, library_id=LIB)
+    assert any(o.get("transaction_id") == tid and o["status"] == "rolled_back" for o in outcomes)
+    assert lib.items["N1"]["data"]["parentItem"] == "M2"
+    assert set(lib.items["M1"]["data"]["collections"]) == {"C1"}
+    assert unresolved_transactions(prov) == []
+    assert raw2  # silence lint
+
+
+def test_concurrent_412_at_master_patch_resolves_its_own_intent(tmp_path, live):
+    """The one legitimate post-intent zero-write abort: the first master PATCH 412s. Nothing landed,
+    so the intent must be resolved by an explicit no-write terminal — not left as a phantom orphan,
+    and not laundered by a later Gate-0 block (F-1 fix edge)."""
+    lib = FakeLibrary(make_raw())
+    prov = ProvenanceStore(tmp_path / "p")
+    tid = _propose(lib, prov)["transaction_id"]
+    orig_record = prov.record
+    def record_hook(**kw):
+        rec = orig_record(**kw)
+        if kw.get("activity") == TXN_INTENT:
+            lib.external_edit("M1", title="landed between intent and PATCH")
+        return rec
+    prov.record = record_hook
+    res = _execute(tid, lib, prov)
+    prov.record = orig_record
+    assert res.state == "blocked_before_write"
+    assert lib.write_log == [], "the 412 PATCH landed nothing"
+    assert lib.items["M1"]["data"]["title"] == "landed between intent and PATCH"
+    assert unresolved_transactions(prov) == [], \
+        "a zero-write abort must resolve its own intent explicitly"
+
+
 def test_blocked_txn_is_not_an_orphan(tmp_path, live):
     """A blocked_before_write terminal record resolves the intent bookkeeping — it must not linger
     as a phantom unresolved transaction."""

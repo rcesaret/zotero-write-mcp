@@ -561,8 +561,11 @@ def unresolved_transactions(prov: ProvenanceStore) -> list:
                     "snapshot_id": orphan.get("was_derived_from"),
                     "item_key": (orphan.get("entity") or {}).get("item_key"),
                     "ts": orphan.get("ts")})
+    # Review finding F-1: Gate-0 refusals (merge_txn_blocked) and shadow runs are NOT terminal for
+    # intent bookkeeping — a blocked RETRY of a crashed transaction id must not erase its orphan.
+    # The only no-write intent-resolving terminal is merge_txn_aborted_no_write (412 at first PATCH).
     txn_terminal_acts = {"merge_txn_result", "merge_txn_rolled_back", "merge_txn_unresolved",
-                         "merge_txn_shadow", "merge_txn_blocked"}
+                         "merge_txn_aborted_no_write"}
     resolved_txn = set()
     unresolved_txn: dict = {}
     txn_terminal_ids: set = set()

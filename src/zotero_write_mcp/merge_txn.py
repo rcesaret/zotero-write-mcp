@@ -47,13 +47,20 @@ TXN_WRITE_INTENT = "merge_txn_write_intent"   # appended BEFORE each gateway wri
 TXN_WRITE = "merge_txn_write"                 # appended AFTER the write succeeds (carries new_version)
 TXN_SHADOW = "merge_txn_shadow"
 TXN_RESULT = "merge_txn_result"          # committed
-TXN_BLOCKED = "merge_txn_blocked"        # blocked_before_write — no library mutation occurred
+TXN_BLOCKED = "merge_txn_blocked"        # Gate-0 refusal — recorded for audit, NEVER intent-resolving
+TXN_ABORTED = "merge_txn_aborted_no_write"   # post-intent abort with ZERO landed writes (412 at
+                                             # the first PATCH) — the only Gate-independent no-write
+                                             # terminal that may resolve an intent
 TXN_ROLLED_BACK = "merge_txn_rolled_back"
 TXN_UNRESOLVED = "merge_txn_unresolved"
 TXN_RESOLVED = "merge_txn_resolved"
 
-_TERMINAL_ACTIVITIES = frozenset({TXN_RESULT, TXN_ROLLED_BACK, TXN_UNRESOLVED,
-                                  TXN_BLOCKED, TXN_SHADOW})
+# Review finding F-1 (2026-07-30, BLOCKER): TXN_BLOCKED/TXN_SHADOW must NOT be intent-resolving.
+# A Gate-0 refusal of a RETRIED transaction id carries the same transaction_id as the crashed run's
+# orphaned TXN_INTENT — treating it as terminal silently erased the orphan, unblocked destructive
+# work, and made the crashed run's partial writes unrecoverable. Gate-0 records always precede this
+# run's own intent, and shadow runs record no intent at all, so neither may ever resolve one.
+_TERMINAL_ACTIVITIES = frozenset({TXN_RESULT, TXN_ROLLED_BACK, TXN_UNRESOLVED, TXN_ABORTED})
 
 
 @dataclass
@@ -337,7 +344,7 @@ def execute_merge_txn(transaction_id: str, reader: Any, gateway: Any, prov: Prov
     integrity = prov.scan_integrity()
     if integrity["status"] == "blocked":
         return blocked(
-            f"PROV log integrity is blocked: {len(integrity['unaccepted'])} unaccepted damaged "
+            f"PROV log integrity is blocked: {integrity['unaccepted_count']} unaccepted damaged "
             "line(s) (LOG-001).",
             "Inspect and resolve with scripts/accept_prov_damage.py, then re-run.")
 
@@ -473,9 +480,16 @@ def execute_merge_txn(transaction_id: str, reader: Any, gateway: Any, prov: Prov
         try:
             txn.write("patch-master", m, master_body, snap.items[m].version)
         except ConcurrencyConflictError:
-            # First write got 412 atomically: nothing landed anywhere.
-            return blocked("concurrent edit detected at the master PATCH (412); no write occurred.",
-                           "Re-run propose_merge_txn against the current state.")
+            # First write got 412 atomically: nothing landed anywhere. This is the ONE post-intent
+            # abort allowed to resolve its own intent (F-1): it records the dedicated no-write
+            # terminal, not a Gate-0 TXN_BLOCKED (which is never intent-resolving).
+            reason = "concurrent edit detected at the master PATCH (412); no write occurred."
+            prov.record(activity=TXN_ABORTED, item_key=m, snapshot_id=snap.snapshot_id,
+                        agent="merge-txn", tool_version=__version__,
+                        params={"transaction_id": tid, "reason": reason, "writes_applied": []})
+            return TxnResult(tid, "blocked_before_write", reason=reason,
+                             snapshot_id=snap.snapshot_id,
+                             next_action="Re-run propose_merge_txn against the current state.")
 
         # ── Reparent children ──────────────────────────────────────────────────
         try:

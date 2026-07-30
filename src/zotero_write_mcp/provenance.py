@@ -221,9 +221,11 @@ class ProvenanceStore:
                 if len(line) > self.MAX_LINE_BYTES:
                     continue   # oversized line: unparseable by policy; scan_integrity reports it
                 try:
-                    yield json.loads(line)
+                    rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue   # skip, never `break` — a torn line must not hide the records after it
+                if isinstance(rec, dict):   # F-3: non-dict JSON is damage (scan says so) — never yield it,
+                    yield rec               # or every .get() consumer crashes after owner acceptance
 
     # ── Log integrity (Routine Supervised v1.0: LOG-001 fail-closed readiness) ──
 
@@ -253,13 +255,19 @@ class ProvenanceStore:
         damage. This is deliberately NOT a cryptographic claim (LOG-003): in the supervised single-
         principal deployment the acceptance record is same-principal-writable; it provides visibility
         and an audit trail, not authentication.
+
+        F-2 (review, MAJOR): ``status``/``unaccepted_count`` are computed from EVERY damaged line —
+        only the DETAIL lists (``bad_lines``/``unaccepted``/``accepted``) are capped at
+        ``MAX_BAD_LINE_DETAIL`` entries each, with ``unaccepted`` prioritising still-blocking lines
+        so successive accept-and-rescan rounds always surface the remaining damage.
         """
-        bad: list = []
+        bad_all: list = []            # EVERY damaged line (identity + detail) — uncapped
         accepted_marks: set = set()
         total = 0
         valid = 0
         if not self.prov_path.exists():
             return {"status": "ok", "total_lines": 0, "valid_records": 0,
+                    "bad_line_count": 0, "unaccepted_count": 0,
                     "bad_lines": [], "unaccepted": [], "accepted": []}
         with open(self.prov_path, "rb") as f:
             raw_lines = f.read().split(b"\n")
@@ -284,19 +292,22 @@ class ProvenanceStore:
                     p = rec.get("params") or {}
                     accepted_marks.add((p.get("line_no"), p.get("line_sha256")))
                 continue
-            if len(bad) < self.MAX_BAD_LINE_DETAIL:
-                bad.append({
-                    "line_no": idx,
-                    "line_sha256": sha256_hex(stripped),
-                    "preview": stripped[:120].decode("utf-8", errors="replace"),
-                    "at_eof": idx == n_lines,
-                    "reason": ("oversized" if len(stripped) > self.MAX_LINE_BYTES else "malformed"),
-                })
-        unaccepted = [b for b in bad if (b["line_no"], b["line_sha256"]) not in accepted_marks]
-        accepted = [b for b in bad if (b["line_no"], b["line_sha256"]) in accepted_marks]
-        status = "ok" if not bad else ("accepted_damage" if not unaccepted else "blocked")
+            bad_all.append({
+                "line_no": idx,
+                "line_sha256": sha256_hex(stripped),
+                "preview": stripped[:120].decode("utf-8", errors="replace"),
+                "at_eof": idx == n_lines,
+                "reason": ("oversized" if len(stripped) > self.MAX_LINE_BYTES else "malformed"),
+            })
+        unaccepted_all = [b for b in bad_all if (b["line_no"], b["line_sha256"]) not in accepted_marks]
+        accepted_all = [b for b in bad_all if (b["line_no"], b["line_sha256"]) in accepted_marks]
+        # Status from the FULL sets; details capped.
+        status = "ok" if not bad_all else ("accepted_damage" if not unaccepted_all else "blocked")
+        cap = self.MAX_BAD_LINE_DETAIL
         return {"status": status, "total_lines": total, "valid_records": valid,
-                "bad_lines": bad, "unaccepted": unaccepted, "accepted": accepted}
+                "bad_line_count": len(bad_all), "unaccepted_count": len(unaccepted_all),
+                "bad_lines": bad_all[:cap], "unaccepted": unaccepted_all[:cap],
+                "accepted": accepted_all[:cap]}
 
     def accept_log_damage(self, line_no: int, line_sha256: str, *, note: str,
                           operator: str = "owner") -> dict:

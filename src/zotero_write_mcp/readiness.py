@@ -106,15 +106,19 @@ def log_integrity_row(prov: ProvenanceStore) -> dict:
         "status": "pass" if ok else "fail",
         "integrity_status": report["status"],
         "valid_records": report["valid_records"],
+        "bad_line_count": report["bad_line_count"],         # F-2: uncapped truth, not detail length
+        "unaccepted_count": report["unaccepted_count"],
         "bad_lines": [{"line_no": b["line_no"], "sha256": b["line_sha256"], "at_eof": b["at_eof"],
                        "reason": b["reason"]} for b in report["bad_lines"]],
         "detail": (f"PROV log integrity: {report['status']} "
                    f"({report['valid_records']} valid records"
-                   + (f", {len(report['accepted'])} accepted damaged line(s) still visible" if report["accepted"] else "")
+                   + (f", {report['bad_line_count']} accepted damaged line(s) still visible"
+                      if report["status"] == "accepted_damage" else "")
                    + ")."
                    if ok else
-                   f"PROV log integrity BLOCKED: {len(report['unaccepted'])} unaccepted damaged line(s). "
-                   "Inspect and resolve with scripts/accept_prov_damage.py before any destructive work."),
+                   f"PROV log integrity BLOCKED: {report['unaccepted_count']} unaccepted damaged "
+                   "line(s). Inspect and resolve with scripts/accept_prov_damage.py before any "
+                   "destructive work."),
     }
 
 

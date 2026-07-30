@@ -121,6 +121,21 @@ def test_source_aliases_are_not_smuggled_in_as_identity():
     assert _citekey_from_extra(out) == "keepMe"
 
 
+def test_extra_pinned_dup_key_is_accumulated_as_alias(tmp_path):
+    """Review finding F-4: a duplicate whose BBT key is pinned ONLY via the `extra`
+    `Citation Key:` line (the dominant pinning shape — no `citationKey` field) must have that key
+    preserved as a `tex.ids` alias on the survivor, so `@dupkey` citations keep resolving after the
+    merge. It must NOT become the survivor's pinned identity."""
+    from zotero_write_mcp.merge import compute_merge_projection
+    _, _, snap = _cluster(tmp_path)                       # dup extra pins anonUntitled2001, no field
+    proj = compute_merge_projection(snap)
+    out = proj.items["M1"].fields.get("extra") or ""
+    assert _citekey_from_extra(out) == "sandersBasinMexico1979", "survivor identity unchanged"
+    assert "anonUntitled2001" in _tex_ids_of(out), \
+        "the dup's extra-pinned key must survive as a tex.ids alias"
+    assert "sanders1979basin" in _tex_ids_of(out), "pre-existing aliases keep accumulating"
+
+
 # ── the live gate: the scenario that was mis-filed as a BLOCKER now passes it ────────────────────
 
 def _live_verify(items, snap, field_sources):

@@ -319,9 +319,11 @@ def _extra_preserving_identity(master_extra: Optional[str], source_extra: Option
     imports the duplicate's pinned key, which would break every ``@citekey`` citation to the survivor in
     the downstream Pandoc pipeline — and correctly fails check #11 at commit time, so the merge was
     unlandable rather than dangerous. A survivor with NO pinned line keeps having none: the duplicate's
-    pinned key is dropped, not inherited, because identity is not a field to be reconciled. Alias
-    accumulation is unaffected — :func:`_alias_extra` still adds the duplicates' keys as ``tex.ids``
-    afterwards, which is the sanctioned way a merged-away key keeps resolving.
+    pinned key is never inherited AS IDENTITY, because identity is not a field to be reconciled. The
+    duplicate's key is instead preserved as a ``tex.ids`` ALIAS by :func:`_alias_extra`, which harvests
+    the ``citationKey`` field, the ``extra``-pinned ``Citation Key:`` line (review F-4 — an earlier
+    version of this docstring claimed alias accumulation covered this shape when it did not), and any
+    inherited ``tex.ids`` — the sanctioned way a merged-away key keeps resolving.
     """
     keep_key = _citekey_from_extra(master_extra)
     keep_aliases = _tex_ids_of(master_extra)
@@ -407,16 +409,20 @@ def _citekey_from_extra(extra_text: Optional[str]) -> Optional[str]:
 
 def _alias_extra(snapshot: ClusterSnapshot, base_extra: Optional[str] = None) -> Optional[str]:
     """The survivor's ``extra`` with the trashed duplicates' BBT citekeys accumulated as ``tex.ids`` aliases
-    (so a manuscript citing a duplicate's ``@citekey`` still resolves post-merge). Accumulates, per secondary,
-    its pinned ``citationKey`` AND the aliases it ALREADY carries in its own extra ``tex.ids`` (review #3:
-    transitive — a secondary that was itself a prior merge survivor keeps the inherited alias set). None when
-    nothing to preserve."""
+    (so a manuscript citing a duplicate's ``@citekey`` still resolves post-merge). Accumulates, per secondary:
+    its ``citationKey`` field, its ``extra``-pinned ``Citation Key:`` line (review F-4: the dominant BBT
+    pinning shape — previously dropped entirely, silently breaking ``@dupkey`` resolution), AND the aliases
+    it ALREADY carries in its own extra ``tex.ids`` (review #3: transitive — a secondary that was itself a
+    prior merge survivor keeps the inherited alias set). None when nothing to preserve."""
     alias_keys: list = []
     for s in snapshot.secondary_keys:
         sf = snapshot.items[s].fields
         ck = sf.get("citationKey")
         if ck:
             alias_keys.append(ck)
+        pinned = _citekey_from_extra(sf.get("extra"))   # F-4: harvest the extra-pinned key too
+        if pinned:
+            alias_keys.append(pinned)
         alias_keys += _tex_ids_of(sf.get("extra"))
     if not alias_keys:
         return None

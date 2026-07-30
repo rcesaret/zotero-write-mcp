@@ -185,3 +185,40 @@ def test_bad_line_detail_is_bounded(tmp_path):
     report = store.scan_integrity()
     assert report["status"] == "blocked"
     assert len(report["bad_lines"]) == ProvenanceStore.MAX_BAD_LINE_DETAIL
+
+
+def test_uncapped_damage_governs_status_not_the_detail_view(tmp_path):
+    """Review finding F-2 (MAJOR): status/unaccepted must be computed from EVERY damaged line, not
+    from the capped detail list — accepting the 50 displayed lines must not unblock while a 51st
+    undisplayed damaged line exists (LOG-001: never silently omit evidence)."""
+    store = _store(tmp_path)
+    n = ProvenanceStore.MAX_BAD_LINE_DETAIL + 1
+    for i in range(n):
+        _append_raw(store, f"junk-{i}\n".encode())
+    report = store.scan_integrity()
+    assert report["bad_line_count"] == n, "the exact damage COUNT must be reported uncapped"
+    for b in report["unaccepted"]:
+        store.accept_log_damage(b["line_no"], b["line_sha256"], note="inspected batch 1")
+    report2 = store.scan_integrity()
+    assert report2["status"] == "blocked", "the undisplayed damaged line must still block"
+    assert report2["unaccepted"], "the remaining damage must now surface in the detail view"
+    # And accepting the remainder genuinely resolves.
+    for b in report2["unaccepted"]:
+        store.accept_log_damage(b["line_no"], b["line_sha256"], note="inspected batch 2")
+    assert store.scan_integrity()["status"] == "accepted_damage"
+
+
+def test_non_dict_json_line_is_never_yielded(tmp_path):
+    """Review finding F-3 (MINOR): a valid-JSON-but-non-dict line is damage (the scan already says
+    so) and must not be yielded by iter_records — otherwise every .get() consumer crashes AFTER the
+    owner accepts the damage, making acceptance unable to actually unblock the engine."""
+    store = _store(tmp_path)
+    store.record(activity="a1", item_key="K1")
+    _append_raw(store, b"[1, 2, 3]\n")
+    store.record(activity="a2", item_key="K2")
+    assert [r["activity"] for r in store.iter_records()] == ["a1", "a2"]
+    (bad,) = store.scan_integrity()["bad_lines"]
+    store.accept_log_damage(bad["line_no"], bad["line_sha256"], note="non-record json line")
+    assert store.scan_integrity()["status"] == "accepted_damage"
+    # Consumers keep working after acceptance (this is what F-3 broke).
+    assert store.count() >= 2
