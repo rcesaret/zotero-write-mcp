@@ -193,6 +193,10 @@ def test_preview_merge_tool_is_structurally_read_only(monkeypatch):
 
     class _ShadowReport:
         snapshot_id, passed, integrity, projection = "SID1", True, _Integrity(), _Projection()
+        # S5b (Stage-E #2): preview_merge now also reports WHAT the verify ran against — a projection-only
+        # pass is not the commit gate's verdict. Additive to this fake; every assertion below is unchanged.
+        verified_against = "projection"
+        is_gate_authoritative = False
 
     _stub_client(monkeypatch)
     monkeypatch.setattr(server, "WebClusterReader", lambda c, lib: _FakeReader())
@@ -215,6 +219,13 @@ def test_preview_merge_tool_is_structurally_read_only(monkeypatch):
     # threads one through, mirroring shadow_merge's own no-gateway shape.
     import inspect
     assert "gateway" not in inspect.signature(_fake_shadow).parameters
+    # S5b (Stage-E #2): a preview verifies the PROJECTION, which is self-consistent by construction, so
+    # `verify_pass` here is NOT the commit gate's answer. The payload must say so and carry the warning —
+    # otherwise an operator reads a green preview as "this will commit" and can approve a merge the live
+    # gate will refuse (that is the real harm behind the re-graded V11-01).
+    assert out["verified_against"] == "projection"
+    assert out["gate_authoritative"] is False
+    assert "PREVIEW ONLY" in out["warning"]
 
 
 def test_citekey_audit_report_tool_collision_only(monkeypatch):

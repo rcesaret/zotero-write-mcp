@@ -282,7 +282,58 @@ def _rel_target_key(uri: Any) -> str:
 
 # BBT-managed / identity fields enrichment + smart_fill must NEVER take from a duplicate (review #2): the
 # survivor's pinned citation key IS its identity — overwriting it with a dup's key silently breaks citations.
+#
+# S5b (Stage-E #2): this set guarded the right INTENT at the wrong LOCATION. Better BibTeX pins the real
+# key inside ``extra`` as a ``Citation Key:`` line (~27% of this library; the ``citationKey`` field carries
+# the computed key), so ``field_sources={"extra": <secondary>}`` walked past this guard and replaced the
+# survivor's pinned key AND its ``tex.ids`` aliases with the duplicate's. This was NOT a data-loss hole:
+# the live gate catches it, because check #11 re-derives the key from the OBSERVED ``extra`` on a real
+# re-read (measured: observed='anonUntitled2001' snapshot='sandersBasinMexico1979' -> #11 FAILS). The harm
+# was that such a merge looks green in preview and can never commit. ``extra`` is deliberately NOT added to
+# _PROTECTED_FIELDS wholesale — a duplicate's non-identity extra content is legitimately reconcilable — so
+# identity is preserved LINE-WISE instead, in :func:`_extra_preserving_identity`.
 _PROTECTED_FIELDS = frozenset({"citationKey"})
+
+# Lines inside ``extra`` that carry citation IDENTITY rather than content. Never sourced from a duplicate.
+_EXTRA_IDENTITY_PREFIXES = ("citation key:", "tex.ids:")
+
+# Fields ``field_sources`` may NEVER reconcile, because they are STRUCTURE or STATE rather than metadata
+# (S5b Stage-E #2, root cause of finding F2 — BLOCKER). ``field_sources`` is a free-form MCP parameter and
+# ``_enriched_fields`` previously skipped only ``citationKey``, so ``deleted`` — absent from
+# ``_NON_SCALAR_FIELDS`` — was treated as an ordinary scalar. Passing
+# ``field_sources={"deleted": <a member already in the trash>}`` therefore PATCHed ``deleted:1`` onto the
+# SURVIVOR, and because a field under ``field_sources`` is an APPROVED override, check #3 expected it and
+# the 11-check gate passed (this is V11-02's tautology being cashed in). The library keeps 153 trashed
+# secondaries as rollback substrate, so a trashed member to point at is always to hand, and
+# ``compare_items_for_merge`` even PRESENTS ``deleted`` as a reconcilable difference. Deterministic, no
+# race. Skipped silently, matching the existing ``citationKey`` behaviour; a loud refusal would be better
+# and is noted as a follow-up.
+_UNRECONCILABLE_FIELDS = _NON_SCALAR_FIELDS | {"deleted", "itemType", "parentItem"}
+
+
+def _extra_preserving_identity(master_extra: Optional[str], source_extra: Optional[str]) -> str:
+    """The enriched ``extra``: the SOURCE's non-identity lines, with the SURVIVOR's identity lines
+    re-asserted (its pinned ``Citation Key:`` and its own ``tex.ids`` aliases).
+
+    This is what makes ``field_sources={"extra": <dup>}`` safe. Taking a duplicate's ``extra`` verbatim
+    imports the duplicate's pinned key, which would break every ``@citekey`` citation to the survivor in
+    the downstream Pandoc pipeline — and correctly fails check #11 at commit time, so the merge was
+    unlandable rather than dangerous. A survivor with NO pinned line keeps having none: the duplicate's
+    pinned key is dropped, not inherited, because identity is not a field to be reconciled. Alias
+    accumulation is unaffected — :func:`_alias_extra` still adds the duplicates' keys as ``tex.ids``
+    afterwards, which is the sanctioned way a merged-away key keeps resolving.
+    """
+    keep_key = _citekey_from_extra(master_extra)
+    keep_aliases = _tex_ids_of(master_extra)
+    body = [ln for ln in str(source_extra or "").splitlines()
+            if not ln.strip().lower().startswith(_EXTRA_IDENTITY_PREFIXES)]
+    lines = [ln for ln in body if ln.strip()]
+    if keep_key:
+        lines.insert(0, f"Citation Key: {keep_key}")
+    text = "\n".join(lines)
+    if keep_aliases:
+        text = _extra_add_tex_ids(text, keep_aliases)
+    return text
 
 
 def _enriched_fields(snapshot: ClusterSnapshot, field_sources: Optional[dict]) -> dict:
@@ -292,14 +343,25 @@ def _enriched_fields(snapshot: ClusterSnapshot, field_sources: Optional[dict]) -
     this so they agree on the expected enriched master. SKIPS: a protected identity field (citationKey,
     review #2), an unknown source, a field the source lacks, OR a source value that is EMPTY (review #1 —
     enrichment may ADD or IMPROVE, never blank a populated survivor field; clearing a field must be a
-    separate explicit audited op, not a side effect of source selection)."""
+    separate explicit audited op, not a side effect of source selection).
+
+    ``extra`` is the one field NOT taken verbatim: it mixes free content with citation IDENTITY (BBT's
+    pinned ``Citation Key:`` line and ``tex.ids`` aliases), so it goes through
+    :func:`_extra_preserving_identity` — the source's content, the survivor's identity (S5b Stage-E #2).
+    """
     out: dict = {}
     for fld, src in (field_sources or {}).items():
         if fld in _PROTECTED_FIELDS:                                   # review #2: never reconcile identity fields
             continue
+        if fld in _UNRECONCILABLE_FIELDS:      # S5b: structure/state is not metadata — esp. `deleted`
+            continue
         src_item = snapshot.items.get(src)
         if src_item is not None and not _is_empty(src_item.fields.get(fld)):   # review #1: never blank a field
-            out[fld] = src_item.fields[fld]
+            if fld == "extra":
+                master_extra = snapshot.items[snapshot.master_key].fields.get("extra")
+                out[fld] = _extra_preserving_identity(master_extra, src_item.fields[fld])
+            else:
+                out[fld] = src_item.fields[fld]
     return out
 
 
@@ -366,7 +428,16 @@ def _master_overrides(snapshot: ClusterSnapshot, field_sources: Optional[dict]) 
     """The full set of survivor scalar-field overrides a merge applies: the owner-approved field-level
     enrichment (``_enriched_fields``) PLUS citekey-alias accumulation (the duplicates' BBT citekeys preserved
     as ``tex.ids`` on the survivor's ``extra``). Projection, verify, AND the merge PATCH all derive the
-    overrides from this single function, so they agree and the gate enforces EXACTLY this result."""
+    overrides from this single function, so they agree and the gate enforces EXACTLY this result.
+
+    **KNOWN LIMIT — this function is a single point of trust (S5b Stage-E #2, finding V11-02).** Because
+    check #3's expectation and the PATCH are the same computation on the same inputs, ``verify_merge``
+    cannot detect a defect in here: a wrong value would be applied to the survivor AND expected by the
+    gate. Deriving both from one function is the right call — two implementations would drift and the gate
+    would reject good merges — but it means this function's correctness must be established by TESTS, not
+    by the runtime gate. Property-based coverage over ``(snapshot, field_sources)`` invariants is the
+    proposed mitigation; see the S5b PART A handoff.
+    """
     out = _enriched_fields(snapshot, field_sources)
     alias = _alias_extra(snapshot, out.get("extra"))
     if alias is not None:
@@ -384,10 +455,23 @@ def verify_merge(
     """The 11-check fail-closed gate. Compares the before-image ``snapshot`` to the post-merge
     (live or projected) ``observed`` cluster state; passes only if EVERY check passes (§7).
 
-    All expectations are recomputed **independently from the snapshot** (never trusting the observed
-    union); each check maps to a Stage-E C-1.x corruption. Pure function — no I/O. ``field_sources`` (Phase B)
-    threads the owner-approved metadata reconciliation so check #3 expects the ENRICHED master (each field
-    == its chosen source member's value) rather than bare survivor preservation.
+    Expectations are recomputed from the SNAPSHOT, never from the observed union — that is the sense in
+    which they are independent, and it is what makes the observed state untrusted. **It is not
+    independence from the projection** (S5b Stage-E #2 corrected an overstatement here): for any field
+    under ``field_sources``, check #3's expectation and the merge's PATCH both come from the SAME
+    :func:`_master_overrides` call, so a defect INSIDE that function is invisible to this gate — it would
+    corrupt the master and be expected to. See ``_master_overrides``' own note. Each check maps to a
+    Stage-E C-1.x corruption. Pure function — no I/O.
+
+    **``observed`` is entirely caller-supplied, and which caller you are changes what a pass means.**
+    The live gate (``merge_live._commit_merge_inner``) passes a real re-read via :func:`build_cluster`;
+    shadow/preview default to :func:`compute_merge_projection`, which is self-consistent by construction.
+    A pass against the projection is a pipeline exercise, NOT a gate result — e.g. the projection carries
+    ``citekey=sm.citekey`` verbatim, so check #11 is tautological there even when the merge replaced the
+    ``extra`` that holds the real key. Only a pass against a live re-read authorizes a trash.
+
+    ``field_sources`` (Phase B) threads the owner-approved metadata reconciliation so check #3 expects the
+    ENRICHED master (each field == its chosen source member's value) rather than bare survivor preservation.
     """
     checks: list = []
     m = snapshot.master_key
@@ -738,6 +822,18 @@ class ShadowReport:
     passed: bool
     integrity: IntegrityReport
     projection: ClusterSnapshot
+    # S5b (Stage-E #2): what `passed` was actually computed against. "projection" means the verify ran
+    # against a self-consistent construction and is NOT a gate result — a caller must not present it as
+    # one. "observed" means a real re-read of live post-merge state, which IS gate-authoritative.
+    verified_against: str = "projection"
+
+    @property
+    def is_gate_authoritative(self) -> bool:
+        """True only when `passed` came from verifying a real re-read. A projection-only pass can be
+        green for a merge the live gate would REJECT (e.g. an `extra` override that replaces the pinned
+        citekey: the projection carries `citekey=sm.citekey`, so check #11 cannot see it). Callers that
+        surface `passed` to a human deciding whether to approve a merge MUST surface this too."""
+        return self.verified_against == "observed"
 
 
 def shadow_merge(
@@ -774,4 +870,5 @@ def shadow_merge(
                 "secondary_keys": list(dup_keys), "smart_fill": smart_fill},
     )
     return ShadowReport(snapshot_id=snap.snapshot_id, passed=report.passed,
-                        integrity=report, projection=projection)
+                        integrity=report, projection=projection,
+                        verified_against=("observed" if observed is not None else "projection"))

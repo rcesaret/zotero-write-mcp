@@ -1075,16 +1075,33 @@ def preview_merge(master_key: str, dup_keys: list, field_sources: Optional[dict]
     watch_fields = set(list(field_sources or {}) + ["extra"])
     changes = {f: {"from": sm_before.get(f), "to": survivor.fields.get(f)}
               for f in watch_fields if survivor.fields.get(f) != sm_before.get(f)}
-    return json.dumps({
+    out = {
         "snapshot_id": sr.snapshot_id,
         "verify_pass": sr.passed,
+        # S5b (Stage-E #2): a preview verifies the PROJECTION, which is self-consistent by construction,
+        # so `verify_pass` is NOT the commit gate's answer. Say so in the payload rather than let an
+        # operator read a green preview as "this will commit" — some merges are green here and REJECTED
+        # live (e.g. an `extra` override replacing the survivor's pinned citekey: the projection carries
+        # citekey=sm.citekey so check #11 is tautological, while a live re-read derives the key from the
+        # new `extra` and fails). Approving something that can never commit is the real user-facing harm.
+        "verified_against": sr.verified_against,
+        "gate_authoritative": sr.is_gate_authoritative,
         "checks": [{"number": c.number, "name": c.name, "pass": c.passed, "detail": c.detail}
                    for c in sr.integrity.checks],
         "survivor_changes": changes,
         "trash_would_be": list(dup_keys),
         "collections_after": survivor.collections,
         "tags_after": survivor.tags,
-    })
+    }
+    if not sr.is_gate_authoritative:
+        out["warning"] = (
+            "PREVIEW ONLY — `verify_pass` was computed against the PROJECTED post-merge state, not a "
+            "re-read of the live library, so it is NOT the commit gate's verdict. Checks whose "
+            "expectation the projection itself supplies (notably #11 citekey-preservation, and any field "
+            "under field_sources via check #3) cannot fail here. The authoritative gate runs inside "
+            "commit_merge against build_cluster output; a green preview can still be refused there."
+        )
+    return json.dumps(out)
 
 
 @mcp.tool()

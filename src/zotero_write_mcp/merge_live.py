@@ -212,6 +212,16 @@ def _terminal_verify(snapshot, final, sec_keys, *, library_base, smart_fill=Fals
     fm = final.items.get(m)
     if fm is None:
         failed.append("master-absent")
+    elif _is_trashed(fm):
+        # S5b (Stage-E #2, finding F2 — BLOCKER). This gate called `_is_trashed` on every CHILD and on
+        # every SECONDARY (which must BE trashed), but for the master it asked only `is None`. A trashed
+        # survivor is not None — it is present carrying deleted:1 — so `commit_merge` returned
+        # mode="committed" with PROV pass:true while the SURVIVOR sat in the trash and its duplicates had
+        # been deleted. Measured: mode='committed' verify_passed=True trashed=['M2'] SURVIVOR deleted=1.
+        # The symmetric `verify_merge` DOES catch this same state (check #3: "added=['deleted']") — which
+        # is precisely the asymmetry, since this scoped re-verify is the only gate that runs AFTER the
+        # trash, where verify_merge structurally cannot.
+        failed.append("master-trashed")
     else:
         if set(fm.collections) != set(proj_m.collections):
             failed.append("master-collections")
